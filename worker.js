@@ -18,6 +18,24 @@ app.get("/", (req, res) => {
 });
 
 app.get("/alerts", async (req, res) => {
+  app.get("/test", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      INSERT INTO alerts (ticker, price, percent_change, rvol, float, news)
+      VALUES ('TEST', 5.25, 12.5, 6.2, 3000000, true)
+      RETURNING *
+    `);
+
+    res.json({
+      success: true,
+      alert: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
   app.get('/test', async (req, res) => {
   try {
     const result = await pool.query(`
