@@ -1,38 +1,59 @@
 const express = require("express");
+const { Pool } = require("pg");
 
 const POLYGON_KEY = process.env.POLYGON_KEY;
+const DATABASE_URL = process.env.DATABASE_URL;
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
 
 const app = express();
 
 app.get("/", (req, res) => {
-  res.status(200).send("Quantum Scan Worker is running ✅");
+  res.send("Quantum Scan Worker is running ✅");
 });
 
-app.get("/health", (req, res) => {
-  res.status(200).json({ ok: true });
+app.get("/alerts", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM alerts ORDER BY created_at DESC LIMIT 50"
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Temporary endpoint so Railway has something to hit
-app.get("/alerts", (req, res) => {
-  res.status(200).json([]);
-});
+async function saveAlert(ticker, price, change, volume) {
+  try {
+    await pool.query(
+      `
+      INSERT INTO alerts (ticker, price, change_percent, volume)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT DO NOTHING
+      `,
+      [ticker, price, change, volume]
+    );
+  } catch (err) {
+    console.error("DB save error:", err.message);
+  }
+}
 
 async function scan() {
   try {
     console.log("Scanning market...");
 
-    if (!POLYGON_KEY) {
-      console.log("Missing POLYGON_KEY env var");
-      return;
-    }
+    const response = await fetch(
+      `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey=${POLYGON_KEY}`
+    );
 
-    const url =
-      `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey=${POLYGON_KEY}`;
-
-    const response = await fetch(url);
     const data = await response.json();
 
-    const tickers = Array.isArray(data?.tickers) ? data.tickers : [];
+    const tickers = data?.tickers || [];
 
     const results = tickers.filter((ticker) => {
       const price = ticker?.lastTrade?.p ?? 0;
@@ -48,17 +69,26 @@ async function scan() {
     });
 
     console.log("Matches:", results.map(r => r.ticker));
+
+    for (const ticker of results) {
+      await saveAlert(
+        ticker.ticker,
+        ticker.lastTrade?.p ?? 0,
+        ticker.todaysChangePerc ?? 0,
+        ticker.day?.v ?? 0
+      );
+    }
+
   } catch (err) {
-    console.error("Scan error:", err);
+    console.error("Scan error:", err.message);
   }
 }
 
-// Run once on boot, then every 60s
 scan();
 setInterval(scan, 60000);
 
-// IMPORTANT: listen on Railway's port
 const PORT = process.env.PORT || 8080;
+
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log("Server running on port", PORT);
 });
