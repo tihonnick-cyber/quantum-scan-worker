@@ -62,7 +62,7 @@ async function scan() {
 
       return (
         price >= 2 &&
-        price <= 4 &&
+        price <= 20 &&
         change >= 10 &&
         volume >= 500000
       );
