@@ -18,6 +18,22 @@ app.get("/", (req, res) => {
 });
 
 app.get("/alerts", async (req, res) => {
+  app.get('/test', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      INSERT INTO alerts (ticker, price, percent_change, rvol, float, news)
+      VALUES ('TEST', 5.25, 12.5, 6.2, 3200000, true)
+      RETURNING *;
+    `);
+
+    res.json({
+      success: true,
+      inserted: result.rows[0]
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
   try {
     const result = await pool.query(
       "SELECT * FROM alerts ORDER BY created_at DESC LIMIT 50"
