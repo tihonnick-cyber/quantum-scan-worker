@@ -10,7 +10,7 @@ async function scan() {
 
     const data = await response.json();
 
-    const results = data.tickers.filter(ticker => {
+    const results = (data.tickers || []).filter(ticker => {
       const price = ticker.lastTrade?.p || 0;
       const change = ticker.todaysChangePerc || 0;
       const volume = ticker.day?.v || 0;
