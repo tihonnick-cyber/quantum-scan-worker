@@ -6,29 +6,34 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false,
-  },
+  ssl: { rejectUnauthorized: false },
 });
 
 const app = express();
 
+app.use(express.json());
+
+/* =========================
+   BASIC STATUS ROUTE
+========================= */
 app.get("/", (req, res) => {
-  res.send("Quantum Scan Worker is running ✅");
+  res.send("Quantum Scan Worker is running");
 });
 
-app.get("/alerts", async (req, res) => {
-  app.get("/test", async (req, res) => {
+/* =========================
+   TEST INSERT ROUTE
+========================= */
+app.get("/test", async (req, res) => {
   try {
     const result = await pool.query(`
-      INSERT INTO alerts (ticker, price, percent_change, rvol, float, news)
-      VALUES ('TEST', 5.25, 12.5, 6.2, 3000000, true)
-      RETURNING *
+      INSERT INTO alerts (ticker, price, percent_change, rvol, float, news, created_at)
+      VALUES ('TEST', 5.25, 12.5, 300000, 2000000, true, now())
+      RETURNING *;
     `);
 
     res.json({
       success: true,
-      alert: result.rows[0]
+      alert: result.rows[0],
     });
 
   } catch (err) {
@@ -36,49 +41,56 @@ app.get("/alerts", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-  app.get('/test', async (req, res) => {
-  try {
-    const result = await pool.query(`
-      INSERT INTO alerts (ticker, price, percent_change, rvol, float, news)
-      VALUES ('TEST', 5.25, 12.5, 6.2, 3200000, true)
-      RETURNING *;
-    `);
 
-    res.json({
-      success: true,
-      inserted: result.rows[0]
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+/* =========================
+   GET ALERTS ROUTE
+========================= */
+app.get("/alerts", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT * FROM alerts ORDER BY created_at DESC LIMIT 50"
+      "SELECT * FROM alerts ORDER BY created_at DESC LIMIT 100"
     );
+
     res.json(result.rows);
+
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
+/* =========================
+   SAVE ALERT FUNCTION
+========================= */
 async function saveAlert(ticker, price, change, volume) {
   try {
-    await pool.query(
-      `
-      INSERT INTO alerts (ticker, price, change_percent, volume)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-      ON CONFLICT DO NOTHING
-      `,
-      [ticker, price, change, volume]
-    );
+
+    await pool.query(`
+      INSERT INTO alerts (
+        ticker,
+        price,
+        percent_change,
+        rvol,
+        float,
+        news,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, 0, false, now())
+      ON CONFLICT DO NOTHING;
+    `, [ticker, price, change, volume]);
+
   } catch (err) {
     console.error("DB save error:", err.message);
   }
 }
 
+/* =========================
+   MARKET SCANNER
+========================= */
 async function scan() {
+
   try {
+
     console.log("Scanning market...");
 
     const response = await fetch(
@@ -89,7 +101,8 @@ async function scan() {
 
     const tickers = data?.tickers || [];
 
-    const results = tickers.filter((ticker) => {
+    const matches = tickers.filter((ticker) => {
+
       const price = ticker?.lastTrade?.p ?? 0;
       const change = ticker?.todaysChangePerc ?? 0;
       const volume = ticker?.day?.v ?? 0;
@@ -100,27 +113,39 @@ async function scan() {
         change >= 10 &&
         volume >= 500000
       );
+
     });
 
-    console.log("Matches:", results.map(r => r.ticker));
+    console.log("Matches:", matches.map(t => t.ticker));
 
-    for (const ticker of results) {
+    for (const ticker of matches) {
+
       await saveAlert(
         ticker.ticker,
         ticker.lastTrade?.p ?? 0,
         ticker.todaysChangePerc ?? 0,
         ticker.day?.v ?? 0
       );
+
     }
 
   } catch (err) {
+
     console.error("Scan error:", err.message);
+
   }
+
 }
 
+/* =========================
+   RUN SCANNER EVERY 15s
+========================= */
 scan();
 setInterval(scan, 60000);
 
+/* =========================
+   START SERVER
+========================= */
 const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, "0.0.0.0", () => {
