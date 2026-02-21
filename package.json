@@ -2,7 +2,11 @@
   "name": "quantum-scan-worker",
   "version": "1.0.0",
   "main": "worker.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node worker.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
   }
 }
