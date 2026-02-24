@@ -10,6 +10,7 @@ const pool = new Pool({
 });
 
 const app = express();
+let isScanning = false;
 
 app.use(express.json());
 
@@ -88,6 +89,9 @@ async function saveAlert(ticker, price, change, volume) {
    MARKET SCANNER
 ========================= */
 async function scan() {
+  if (isScanning) return;
+  isScanning = true;
+  const started = Date.now();
 
   try {
 
@@ -127,13 +131,13 @@ async function scan() {
         ticker.day?.v ?? 0
       );
 
-    }
-
+    
   } catch (err) {
-
-    console.error("Scan error:", err.message);
-
-  }
+  console.error("Scan error:", err.message);
+} finally {
+  console.log("Scan duration (ms):", Date.now() - started);
+  isScanning = false;
+}
 
 }
 
@@ -141,7 +145,7 @@ async function scan() {
    RUN SCANNER EVERY 15s
 ========================= */
 scan();
-setInterval(scan, 60000);
+setInterval(scan, 15000);
 
 /* =========================
    START SERVER
