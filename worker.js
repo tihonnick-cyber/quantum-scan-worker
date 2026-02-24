@@ -3,7 +3,7 @@
 const express = require("express");
 const { Pool } = require("pg");
 
-// Node 18+ has fetch globally (Railway Node 22 does)
+// Node 18+ has fetch globally (Railway Node 20/22 does)
 if (typeof fetch !== "function") {
   throw new Error("Global fetch not found. Use Node 18+ on Railway.");
 }
@@ -18,6 +18,9 @@ if (typeof fetch !== "function") {
  * =========================
  * OPTIONAL ENV VARS
  * =========================
+ * BASE44_INGEST_URL=https://quantum-scan-pro.base44.app/api/functions/ingestAlert
+ * BASE44_API_KEY=xxxxxxxxxxxxxxxx
+ *
  * SCAN_INTERVAL_MS=15000
  * PRICE_MIN=2
  * PRICE_MAX=20
@@ -34,10 +37,19 @@ if (typeof fetch !== "function") {
 const POLYGON_KEY = process.env.POLYGON_KEY;
 const DATABASE_URL = process.env.DATABASE_URL;
 
+const BASE44_INGEST_URL = process.env.BASE44_INGEST_URL || "";
+const BASE44_API_KEY = process.env.BASE44_API_KEY || "";
+
 if (!POLYGON_KEY) console.error("Missing env var: POLYGON_KEY");
 if (!DATABASE_URL) console.error("Missing env var: DATABASE_URL");
 
-// Criteria
+// ===== Criteria (your 5 rules) =====
+// 1) RVOL >= 5x (today volume / avg daily volume over last N days)
+// 2) Up >= 10% today
+// 3) Has news event (within lookback window)
+// 4) Price between $2 and $20
+// 5) Supply: shares/float <= 5,000,000
+
 const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 15000);
 
 const PRICE_MIN = Number(process.env.PRICE_MIN || 2);
@@ -55,20 +67,21 @@ const ALERT_COOLDOWN_MIN = Number(process.env.ALERT_COOLDOWN_MIN || 30);
 const MAX_CANDIDATES = Number(process.env.MAX_CANDIDATES || 60);
 const CONCURRENCY = Number(process.env.CONCURRENCY || 6);
 
-// Postgres pool (Railway typically needs ssl rejectUnauthorized false)
+// ===== Postgres pool (Railway typically needs ssl rejectUnauthorized false) =====
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
+// ===== Express =====
 const app = express();
 app.use(express.json());
 
-/**
- * =========================
- * ROUTES
- * =========================
- */
+// =========================
+// ROUTES
+// =========================
+let isScanning = false;
+let lastScanAt = null;
 
 app.get("/", (req, res) => {
   res.send("Quantum Scan Worker is running");
@@ -77,7 +90,13 @@ app.get("/", (req, res) => {
 app.get("/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
-    res.json({ ok: true, db: "connected", lastScanAt });
+    res.json({
+      ok: true,
+      db: "connected",
+      lastScanAt,
+      isScanning,
+      scanIntervalMs: SCAN_INTERVAL_MS,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, db: "error", error: e.message });
   }
@@ -99,7 +118,6 @@ app.get("/alerts", async (req, res) => {
 
 app.get("/test", async (req, res) => {
   try {
-    // Inserts a sample alert so you can confirm DB works.
     const inserted = await insertAlert({
       ticker: "TEST",
       price: 5.25,
@@ -109,6 +127,16 @@ app.get("/test", async (req, res) => {
       news: true,
     });
 
+    // optional: also send to Base44
+    await pushToBase44({
+      ticker: inserted.ticker,
+      price: inserted.price,
+      percent_change: inserted.percent_change,
+      rvol: inserted.rvol,
+      float: inserted.float,
+      news: inserted.news,
+    });
+
     res.json({ success: true, alert: inserted });
   } catch (err) {
     console.error("GET /test error:", err.message);
@@ -116,12 +144,9 @@ app.get("/test", async (req, res) => {
   }
 });
 
-/**
- * =========================
- * DB HELPERS
- * =========================
- */
-
+// =========================
+// DB HELPERS
+// =========================
 async function insertAlert({ ticker, price, percent_change, rvol, float, news }) {
   const result = await pool.query(
     `
@@ -139,14 +164,9 @@ async function insertAlert({ ticker, price, percent_change, rvol, float, news })
     `,
     [ticker, price, percent_change, rvol, float, news]
   );
-
   return result.rows[0];
 }
 
-/**
- * Optional: DB-based dedupe (prevents inserts if we already alerted recently).
- * This keeps your DB from filling with the same ticker every 15s.
- */
 async function wasAlertedRecently(ticker) {
   const minutes = ALERT_COOLDOWN_MIN;
   const result = await pool.query(
@@ -162,21 +182,38 @@ async function wasAlertedRecently(ticker) {
   return result.rowCount > 0;
 }
 
-/**
- * =========================
- * POLYGON HELPERS + CACHES
- * =========================
- *
- * We cache expensive per-ticker data to avoid rate-limit problems:
- * - avg volume (30 day) cached for 6 hours
- * - float/shares cached for 24 hours
- * - news presence cached for 5 minutes
- */
+// =========================
+// BASE44 PUSH (optional)
+// =========================
+async function pushToBase44(alert) {
+  if (!BASE44_INGEST_URL || !BASE44_API_KEY) return;
 
+  try {
+    const resp = await fetch(BASE44_INGEST_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        api_key: BASE44_API_KEY,
+      },
+      body: JSON.stringify(alert),
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      console.error("Base44 ingest failed:", resp.status, text.slice(0, 200));
+    }
+  } catch (e) {
+    console.error("Base44 ingest error:", e.message);
+  }
+}
+
+// =========================
+// POLYGON HELPERS + CACHES
+// =========================
 const cache = {
-  avgVol: new Map(),   // key: ticker -> { value, expiresAt }
-  float: new Map(),    // key: ticker -> { value, expiresAt }
-  news: new Map(),     // key: ticker -> { value (boolean), expiresAt }
+  avgVol: new Map(), // ticker -> { value, expiresAt }
+  float: new Map(),  // ticker -> { value, expiresAt }
+  news: new Map(),   // ticker -> { value, expiresAt }
 };
 
 function getCache(map, key) {
@@ -203,17 +240,12 @@ async function polygonJson(url) {
 }
 
 /**
- * Get 30-day average daily volume using Aggs.
- * Endpoint:
- * /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}
- *
- * We compute average volume over the returned days.
+ * 30-day average daily volume (Aggs)
  */
 async function getAvgDailyVolume(ticker) {
   const cached = getCache(cache.avgVol, ticker);
   if (cached != null) return cached;
 
-  // Look back enough calendar days to capture ~AVG_VOL_DAYS trading days
   const lookbackCalendarDays = Math.max(AVG_VOL_DAYS * 2, 40);
   const to = new Date();
   const from = new Date(Date.now() - lookbackCalendarDays * 24 * 60 * 60 * 1000);
@@ -228,7 +260,6 @@ async function getAvgDailyVolume(ticker) {
   const data = await polygonJson(url);
 
   const results = Array.isArray(data?.results) ? data.results : [];
-  // results are daily bars; "v" = volume
   const vols = results
     .map((r) => Number(r?.v || 0))
     .filter((v) => Number.isFinite(v) && v > 0)
@@ -240,21 +271,13 @@ async function getAvgDailyVolume(ticker) {
   }
 
   const avg = Math.round(vols.reduce((a, b) => a + b, 0) / vols.length);
-
-  // cache 6 hours
-  setCache(cache.avgVol, ticker, avg, 6 * 60 * 60 * 1000);
+  setCache(cache.avgVol, ticker, avg, 6 * 60 * 60 * 1000); // 6 hours
   return avg;
 }
 
 /**
- * Float / shares available:
- * Polygon does not always give "float" directly in all plans.
- * We try to get the best available:
- * - share_class_shares_outstanding (often present)
- * - weighted_shares_outstanding
- *
- * IMPORTANT: this is shares outstanding, not true float, unless Polygon provides float.
- * If your plan exposes a float field later, we can swap to that immediately.
+ * Shares/float-ish (best available)
+ * NOTE: Depending on your Polygon plan, true float may not exist.
  */
 async function getFloatOrSharesOutstanding(ticker) {
   const cached = getCache(cache.float, ticker);
@@ -267,21 +290,18 @@ async function getFloatOrSharesOutstanding(ticker) {
   const data = await polygonJson(url);
   const res = data?.results || {};
 
-  // Try common fields
   const floatLike =
     Number(res?.float) ||
     Number(res?.share_class_shares_outstanding) ||
     Number(res?.weighted_shares_outstanding) ||
     0;
 
-  // cache 24 hours
-  setCache(cache.float, ticker, floatLike, 24 * 60 * 60 * 1000);
+  setCache(cache.float, ticker, floatLike, 24 * 60 * 60 * 1000); // 24 hours
   return floatLike;
 }
 
 /**
- * News catalyst:
- * Check if Polygon has at least 1 news item for ticker within lookback minutes.
+ * News catalyst: any news within lookback minutes
  */
 async function hasRecentNews(ticker) {
   const cached = getCache(cache.news, ticker);
@@ -291,7 +311,6 @@ async function hasRecentNews(ticker) {
   const lookbackMs = NEWS_LOOKBACK_MIN * 60 * 1000;
   const sinceIso = new Date(now - lookbackMs).toISOString();
 
-  // Polygon news endpoint (v2 reference news is common)
   const url =
     `https://api.polygon.io/v2/reference/news?ticker=${encodeURIComponent(ticker)}` +
     `&published_utc.gte=${encodeURIComponent(sinceIso)}` +
@@ -303,27 +322,18 @@ async function hasRecentNews(ticker) {
     const results = Array.isArray(data?.results) ? data.results : [];
     ok = results.length > 0;
   } catch (e) {
-    // If news endpoint not available on your plan, this may 403.
-    // In that case, news check will always fail (as it should for your criteria).
+    // If endpoint blocked by plan, news will fail -> ok stays false (as your criteria requires).
     console.error(`News check failed for ${ticker}:`, e.message);
     ok = false;
   }
 
-  // cache 5 minutes
-  setCache(cache.news, ticker, ok, 5 * 60 * 1000);
+  setCache(cache.news, ticker, ok, 5 * 60 * 1000); // 5 minutes
   return ok;
 }
 
-/**
- * =========================
- * SCANNER
- * =========================
- */
-
-let isScanning = false;
-let lastScanAt = null;
-
-// In-memory cooldown (extra layer)
+// =========================
+// SCANNER (15s loop)
+// =========================
 const cooldownMap = new Map(); // ticker -> expiresAt
 
 function inCooldown(ticker) {
@@ -374,10 +384,9 @@ async function scan() {
     const data = await polygonJson(url);
     const tickers = Array.isArray(data?.tickers) ? data.tickers : [];
 
-    // PRE-FILTER (cheap) to reduce per-ticker calls:
-    // Criteria we can check from snapshot:
-    // - Price between 2 and 20
-    // - Up 10%+ today
+    // Cheap prefilter:
+    // - price $2-$20
+    // - up 10%+ today
     const candidates = tickers
       .map((t) => {
         const symbol = t?.ticker;
@@ -388,28 +397,26 @@ async function scan() {
       })
       .filter((t) => t.symbol && t.price >= PRICE_MIN && t.price <= PRICE_MAX)
       .filter((t) => t.percentChange >= MIN_PERCENT_CHANGE)
-      // Optional: reduce noise (keeps rate under control)
       .sort((a, b) => b.dayVol - a.dayVol)
       .slice(0, MAX_CANDIDATES);
 
     console.log(`Candidates after prefilter: ${candidates.length}`);
 
-    // Now validate the other 3 criteria (RVOL, NEWS, FLOAT) for candidates only.
     await runWithConcurrency(candidates, CONCURRENCY, async (c) => {
       const ticker = c.symbol;
 
       try {
-        // Cooldown / dedupe (fast)
+        // local cooldown
         if (inCooldown(ticker)) return;
 
-        // DB dedupe (prevents spam even across restarts)
+        // DB cooldown (survives restarts)
         const recently = await wasAlertedRecently(ticker);
         if (recently) {
           setCooldown(ticker);
           return;
         }
 
-        // 1) RVOL = today volume / average daily volume (last 30 trading days)
+        // 1) RVOL = today volume / avg daily volume (30 trading days)
         const avgVol = await getAvgDailyVolume(ticker);
         if (!avgVol || avgVol <= 0) return;
 
@@ -420,26 +427,25 @@ async function scan() {
         const newsOk = await hasRecentNews(ticker);
         if (!newsOk) return;
 
-        // 3) Float < 5M (best available from Polygon reference)
+        // 3) Float/shares <= 5M
         const floatVal = await getFloatOrSharesOutstanding(ticker);
         if (!floatVal || floatVal <= 0) return;
         if (floatVal > MAX_FLOAT) return;
 
-        // ✅ PASSES ALL 5:
-        // 1) RVOL >= 5
-        // 2) Up 10%+
-        // 3) News exists
-        // 4) Price 2-20
-        // 5) Float < 5M
-
-        const inserted = await insertAlert({
+        // ✅ PASSES ALL 5
+        const alertPayload = {
           ticker,
           price: c.price,
           percent_change: c.percentChange,
           rvol: Number(rvol.toFixed(2)),
           float: Math.round(floatVal),
           news: true,
-        });
+        };
+
+        const inserted = await insertAlert(alertPayload);
+
+        // Push to Base44 (optional)
+        await pushToBase44(alertPayload);
 
         setCooldown(ticker);
 
@@ -464,12 +470,9 @@ async function scan() {
   }
 }
 
-/**
- * =========================
- * START SERVER + LOOP
- * =========================
- */
-
+// =========================
+// START SERVER + LOOP
+// =========================
 const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, "0.0.0.0", () => {
@@ -486,6 +489,7 @@ app.listen(PORT, "0.0.0.0", () => {
     ALERT_COOLDOWN_MIN,
     MAX_CANDIDATES,
     CONCURRENCY,
+    BASE44_ENABLED: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
   });
 });
 
