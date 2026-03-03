@@ -21,9 +21,12 @@ if (typeof fetch !== "function") {
  * BASE44_INGEST_URL=https://quantum-scan-pro.base44.app/api/functions/ingestAlert
  * BASE44_API_KEY=xxxxxxxxxxxxxxxx
  *
+ * TELEGRAM_BOT_TOKEN=123456:AA....
+ * TELEGRAM_CHAT_ID=7974446259
+ *
  * SCAN_INTERVAL_MS=60000
- * PRICE_MIN=2
- * PRICE_MAX=20
+ * PRICE_MIN=0.5
+ * PRICE_MAX=40
  * MIN_PERCENT_CHANGE=10
  * MIN_RVOL=5
  * MAX_FLOAT=5000000
@@ -39,6 +42,10 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 const BASE44_INGEST_URL = process.env.BASE44_INGEST_URL || "";
 const BASE44_API_KEY = process.env.BASE44_API_KEY || "";
+
+// Telegram (optional)
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
 if (!POLYGON_KEY) console.error("Missing env var: POLYGON_KEY");
 if (!DATABASE_URL) console.error("Missing env var: DATABASE_URL");
@@ -77,15 +84,15 @@ app.use(express.json());
 let isScanning = false;
 let lastError = null;
 
-let lastLoopAt = null;            // heartbeat: updates every interval even if scan skipped
+let lastLoopAt = null; // heartbeat: updates every interval even if scan skipped
 let lastScanStartedAt = null;
 let lastScanFinishedAt = null;
 let lastScanDurationMs = null;
 
-let tickersFetched = 0;           // how many tickers we pulled from Polygon snapshot (market-wide)
-let candidatesFound = 0;          // how many passed cheap filters
-let deepChecked = 0;              // how many we ran expensive checks on
-let alertsCreated = 0;            // how many alerts inserted (per scan)
+let tickersFetched = 0; // how many tickers we pulled from Polygon snapshot (market-wide)
+let candidatesFound = 0; // how many passed cheap filters
+let deepChecked = 0; // how many we ran expensive checks on
+let alertsCreated = 0; // how many alerts inserted (per scan)
 let scanRuns = 0;
 
 // =========================
@@ -117,6 +124,10 @@ app.get("/health", async (req, res) => {
       deepChecked,
       alertsCreated,
       scanRuns,
+
+      // integrations
+      base44Enabled: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
+      telegramEnabled: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
     });
   } catch (e) {
     res.status(500).json({
@@ -135,6 +146,8 @@ app.get("/health", async (req, res) => {
       deepChecked,
       alertsCreated,
       scanRuns,
+      base44Enabled: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
+      telegramEnabled: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
     });
   }
 });
@@ -172,6 +185,17 @@ app.get("/test", async (req, res) => {
       float: inserted.float,
       news: inserted.news,
     });
+
+    await sendTelegramMessage(
+      `✅ Quantum Scan TEST alert\n` +
+        `${inserted.ticker}  $${Number(inserted.price).toFixed(2)}  (${Number(
+          inserted.percent_change
+        ).toFixed(2)}%)\n` +
+        `RVOL: ${Number(inserted.rvol).toFixed(2)}  Float: ${Number(
+          inserted.float
+        ).toLocaleString()}\n` +
+        `News: ✅`
+    );
 
     res.json({ success: true, alert: inserted });
   } catch (err) {
@@ -244,12 +268,39 @@ async function pushToBase44(alert) {
 }
 
 // =========================
+// TELEGRAM PUSH (optional)
+// =========================
+async function sendTelegramMessage(text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        disable_web_page_preview: true,
+      }),
+    });
+
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      console.error("Telegram send failed:", resp.status, t.slice(0, 200));
+    }
+  } catch (e) {
+    console.error("Telegram error:", e.message);
+  }
+}
+
+// =========================
 // POLYGON HELPERS + CACHES
 // =========================
 const cache = {
   avgVol: new Map(), // ticker -> { value, expiresAt }
-  float: new Map(),  // ticker -> { value, expiresAt }
-  news: new Map(),   // ticker -> { value, expiresAt }
+  float: new Map(), // ticker -> { value, expiresAt }
+  news: new Map(), // ticker -> { value, expiresAt }
 };
 
 function getCache(map, key) {
@@ -281,8 +332,7 @@ async function polygonJson(url) {
  */
 async function fetchAllSnapshotTickers() {
   let all = [];
-  let url =
-    `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey=${POLYGON_KEY}`;
+  let url = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey=${POLYGON_KEY}`;
 
   // Safety: stop runaway pagination
   const MAX_PAGES = 20;
@@ -296,7 +346,9 @@ async function fetchAllSnapshotTickers() {
     if (!nextUrl) break;
 
     // Polygon next_url sometimes lacks apiKey; add it if missing.
-    url = nextUrl.includes("apiKey=") ? nextUrl : `${nextUrl}${nextUrl.includes("?") ? "&" : "?"}apiKey=${POLYGON_KEY}`;
+    url = nextUrl.includes("apiKey=")
+      ? nextUrl
+      : `${nextUrl}${nextUrl.includes("?") ? "&" : "?"}apiKey=${POLYGON_KEY}`;
   }
 
   return all;
@@ -522,6 +574,14 @@ async function scan() {
         await insertAlert(alertPayload);
         await pushToBase44(alertPayload);
 
+        // Telegram notification (optional)
+        await sendTelegramMessage(
+          `🚨 Quantum Scan Alert\n` +
+            `${ticker}  $${c.price.toFixed(2)}  (${c.percentChange.toFixed(2)}%)\n` +
+            `RVOL: ${rvol.toFixed(2)}  Float: ${Math.round(floatVal).toLocaleString()}\n` +
+            `News: ✅`
+        );
+
         alertsCreated += 1;
         setCooldown(ticker);
 
@@ -565,6 +625,7 @@ app.listen(PORT, "0.0.0.0", () => {
     MAX_CANDIDATES,
     CONCURRENCY,
     BASE44_ENABLED: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
+    TELEGRAM_ENABLED: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
 });
 
