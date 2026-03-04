@@ -3,40 +3,21 @@
 const express = require("express");
 const { Pool } = require("pg");
 
-// Node 18+ has fetch globally (Railway Node 20/22 does)
 if (typeof fetch !== "function") {
   throw new Error("Global fetch not found. Use Node 18+ on Railway.");
 }
 
 /**
- * =========================
- * REQUIRED ENV VARS (Railway -> Variables)
- * =========================
+ * REQUIRED ENV VARS
  * POLYGON_KEY
  * DATABASE_URL
  *
- * =========================
- * OPTIONAL ENV VARS
- * =========================
- * BASE44_INGEST_URL=https://quantum-scan-pro.base44.app/api/functions/ingestAlert
- * BASE44_API_KEY=xxxxxxxxxxxxxxxx
+ * OPTIONAL
+ * BASE44_INGEST_URL
+ * BASE44_API_KEY
  *
- * SCAN_INTERVAL_MS=60000
- * PRICE_MIN=2
- * PRICE_MAX=20
- * MIN_PERCENT_CHANGE=10
- * EARLY_MIN_PERCENT_CHANGE=3         <-- NEW (recommended)
- * MIN_RVOL=5
- * MAX_FLOAT=5000000
- * AVG_VOL_DAYS=30
- * NEWS_LOOKBACK_MIN=1440
- * ALERT_COOLDOWN_MIN=30
- * MAX_CANDIDATES=300          (0 or negative = no cap)
- * CONCURRENCY=4
- *
- * VOLUME_SPIKE_MULTIPLIER=3          <-- NEW (you already added)
- * VOLUME_LOOKBACK_MIN=5              <-- NEW (you already added)
- * VOLUME_BASELINE_MIN=30             <-- OPTIONAL (defaults to 30)
+ * TELEGRAM_BOT_TOKEN
+ * TELEGRAM_CHAT_ID
  */
 
 const POLYGON_KEY = process.env.POLYGON_KEY;
@@ -45,18 +26,13 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const BASE44_INGEST_URL = process.env.BASE44_INGEST_URL || "";
 const BASE44_API_KEY = process.env.BASE44_API_KEY || "";
 
-if (!POLYGON_KEY) console.error("Missing env var: POLYGON_KEY");
-if (!DATABASE_URL) console.error("Missing env var: DATABASE_URL");
-
-// ===== Criteria (your 5 rules) =====
+// ===== Criteria (scan rules) =====
 const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 60000);
 
 const PRICE_MIN = Number(process.env.PRICE_MIN || 2);
 const PRICE_MAX = Number(process.env.PRICE_MAX || 20);
 
 const MIN_PERCENT_CHANGE = Number(process.env.MIN_PERCENT_CHANGE || 10);
-const EARLY_MIN_PERCENT_CHANGE = Number(process.env.EARLY_MIN_PERCENT_CHANGE || 3);
-
 const MIN_RVOL = Number(process.env.MIN_RVOL || 5);
 const MAX_FLOAT = Number(process.env.MAX_FLOAT || 5000000);
 
@@ -64,16 +40,33 @@ const AVG_VOL_DAYS = Number(process.env.AVG_VOL_DAYS || 30);
 const NEWS_LOOKBACK_MIN = Number(process.env.NEWS_LOOKBACK_MIN || 1440);
 
 const ALERT_COOLDOWN_MIN = Number(process.env.ALERT_COOLDOWN_MIN || 30);
-
 const MAX_CANDIDATES = Number(process.env.MAX_CANDIDATES || 300);
 const CONCURRENCY = Number(process.env.CONCURRENCY || 4);
 
-// ===== Volume spike detection (NEW) =====
+// ===== Premarket gappers =====
+const PREMARKET_ENABLED = String(process.env.PREMARKET_ENABLED || "true").toLowerCase() === "true";
+const PREMARKET_MIN_GAP = Number(process.env.PREMARKET_MIN_GAP || 5);
+const PREMARKET_MIN_VOL = Number(process.env.PREMARKET_MIN_VOL || 20000);
+const PREMARKET_REQUIRE_NEWS =
+  String(process.env.PREMARKET_REQUIRE_NEWS || "false").toLowerCase() === "true";
+
+// ===== Runners (volume spike ignition) =====
+const RUNNER_ENABLED = String(process.env.RUNNER_ENABLED || "false").toLowerCase() === "true";
+const EARLY_MIN_PERCENT_CHANGE = Number(process.env.EARLY_MIN_PERCENT_CHANGE || 3);
+const RUNNER_MIN_VOL = Number(process.env.RUNNER_MIN_VOL || 20000);
 const VOLUME_SPIKE_MULTIPLIER = Number(process.env.VOLUME_SPIKE_MULTIPLIER || 3);
 const VOLUME_LOOKBACK_MIN = Number(process.env.VOLUME_LOOKBACK_MIN || 5);
 const VOLUME_BASELINE_MIN = Number(process.env.VOLUME_BASELINE_MIN || 30);
 
-// ===== Postgres pool (Railway typically needs ssl rejectUnauthorized false) =====
+// ===== Telegram =====
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+const TELEGRAM_ENABLED = Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+
+if (!POLYGON_KEY) console.error("Missing env var: POLYGON_KEY");
+if (!DATABASE_URL) console.error("Missing env var: DATABASE_URL");
+
+// ===== Postgres pool =====
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -84,31 +77,30 @@ const app = express();
 app.use(express.json());
 
 // =========================
-// RUNTIME STATE (better /health)
+// RUNTIME STATE (/health)
 // =========================
 let isScanning = false;
 let lastError = null;
 
-let lastLoopAt = null; // heartbeat: updates every interval even if scan skipped
+let lastLoopAt = null;
 let lastScanStartedAt = null;
 let lastScanFinishedAt = null;
 let lastScanDurationMs = null;
 
-let tickersFetched = 0; // how many tickers we pulled from Polygon snapshot (market-wide)
-let candidatesFound = 0; // how many passed cheap filters
-let deepChecked = 0; // how many we ran expensive checks on
-let alertsCreated = 0; // how many alerts inserted (per scan)
+let tickersFetched = 0;
+let candidatesFound = 0;
+let deepChecked = 0;
+let alertsCreated = 0;
 let scanRuns = 0;
 
-let earlyCandidates = 0; // how many got into deep-check due to early trigger window
-let spikeChecks = 0; // how many volume spike checks performed
+let premarketCandidates = 0;
+let runnerCandidates = 0;
+let runnerChecked = 0;
 
 // =========================
 // ROUTES
 // =========================
-app.get("/", (req, res) => {
-  res.send("Quantum Scan Worker is running");
-});
+app.get("/", (req, res) => res.send("Quantum Scan Worker is running"));
 
 app.get("/health", async (req, res) => {
   try {
@@ -119,76 +111,55 @@ app.get("/health", async (req, res) => {
       isScanning,
       scanIntervalMs: SCAN_INTERVAL_MS,
       lastError,
-
-      // heartbeat + timing
       lastLoopAt,
       lastScanStartedAt,
       lastScanFinishedAt,
       lastScanDurationMs,
-
-      // criteria
-      PRICE_MIN,
-      PRICE_MAX,
-      MIN_PERCENT_CHANGE,
-      EARLY_MIN_PERCENT_CHANGE,
-      MIN_RVOL,
-      MAX_FLOAT,
-      AVG_VOL_DAYS,
-      NEWS_LOOKBACK_MIN,
-      ALERT_COOLDOWN_MIN,
-      MAX_CANDIDATES,
-      CONCURRENCY,
-
-      // volume spike
-      VOLUME_SPIKE_MULTIPLIER,
-      VOLUME_LOOKBACK_MIN,
-      VOLUME_BASELINE_MIN,
-
-      // counts
       tickersFetched,
       candidatesFound,
-      earlyCandidates,
-      spikeChecks,
       deepChecked,
       alertsCreated,
       scanRuns,
-
+      premarketCandidates,
+      runnerCandidates,
+      runnerChecked,
+      telegramEnabled: TELEGRAM_ENABLED,
       base44Enabled: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
+      criteria: {
+        PRICE_MIN,
+        PRICE_MAX,
+        MIN_PERCENT_CHANGE,
+        MIN_RVOL,
+        MAX_FLOAT,
+        AVG_VOL_DAYS,
+        NEWS_LOOKBACK_MIN,
+        ALERT_COOLDOWN_MIN,
+        MAX_CANDIDATES,
+        CONCURRENCY,
+        PREMARKET_ENABLED,
+        PREMARKET_MIN_GAP,
+        PREMARKET_MIN_VOL,
+        PREMARKET_REQUIRE_NEWS,
+        RUNNER_ENABLED,
+        EARLY_MIN_PERCENT_CHANGE,
+        RUNNER_MIN_VOL,
+        VOLUME_SPIKE_MULTIPLIER,
+        VOLUME_LOOKBACK_MIN,
+        VOLUME_BASELINE_MIN,
+      },
     });
   } catch (e) {
-    res.status(500).json({
-      ok: false,
-      db: "error",
-      error: e.message,
-      isScanning,
-      scanIntervalMs: SCAN_INTERVAL_MS,
-      lastError,
-      lastLoopAt,
-      lastScanStartedAt,
-      lastScanFinishedAt,
-      lastScanDurationMs,
-      tickersFetched,
-      candidatesFound,
-      earlyCandidates,
-      spikeChecks,
-      deepChecked,
-      alertsCreated,
-      scanRuns,
-      base44Enabled: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
-    });
+    res.status(500).json({ ok: false, db: "error", error: e.message });
   }
 });
 
 app.get("/alerts", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM alerts
-       ORDER BY created_at DESC
-       LIMIT 200;`
+      `SELECT * FROM alerts ORDER BY created_at DESC LIMIT 200;`
     );
     res.json(result.rows);
   } catch (err) {
-    console.error("GET /alerts error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -202,20 +173,14 @@ app.get("/test", async (req, res) => {
       rvol: 5.1,
       float: 2000000,
       news: true,
+      alert_type: "TEST",
     });
 
-    await pushToBase44({
-      ticker: inserted.ticker,
-      price: inserted.price,
-      percent_change: inserted.percent_change,
-      rvol: inserted.rvol,
-      float: inserted.float,
-      news: inserted.news,
-    });
+    await pushToBase44(inserted);
+    await sendTelegramAlert(inserted);
 
     res.json({ success: true, alert: inserted });
   } catch (err) {
-    console.error("GET /test error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -223,7 +188,18 @@ app.get("/test", async (req, res) => {
 // =========================
 // DB HELPERS
 // =========================
-async function insertAlert({ ticker, price, percent_change, rvol, float, news }) {
+async function insertAlert({
+  ticker,
+  price,
+  percent_change,
+  rvol,
+  float,
+  news,
+  alert_type = "SCAN",
+  meta = null,
+}) {
+  // If your table doesn't have alert_type/meta columns, either:
+  // 1) add them, or 2) remove these fields from the query.
   const result = await pool.query(
     `
     INSERT INTO alerts (
@@ -233,12 +209,14 @@ async function insertAlert({ ticker, price, percent_change, rvol, float, news })
       rvol,
       float,
       news,
+      alert_type,
+      meta,
       created_at
     )
-    VALUES ($1, $2, $3, $4, $5, $6, now())
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())
     RETURNING *;
     `,
-    [ticker, price, percent_change, rvol, float, news]
+    [ticker, price, percent_change, rvol, float, news, alert_type, meta]
   );
   return result.rows[0];
 }
@@ -284,13 +262,57 @@ async function pushToBase44(alert) {
 }
 
 // =========================
+// TELEGRAM
+// =========================
+async function sendTelegram(text) {
+  if (!TELEGRAM_ENABLED) return;
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        disable_web_page_preview: true,
+      }),
+    });
+
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      console.error("Telegram send failed:", resp.status, t.slice(0, 200));
+    }
+  } catch (e) {
+    console.error("Telegram send error:", e.message);
+  }
+}
+
+function formatAlertText(a) {
+  const type = a.alert_type || "SCAN";
+  const px = Number(a.price || 0).toFixed(2);
+  const chg = Number(a.percent_change || 0).toFixed(2);
+  const rvol = a.rvol != null ? Number(a.rvol).toFixed(2) : "n/a";
+  const flt = a.float ? Math.round(Number(a.float)) : 0;
+  const news = a.news ? "Yes" : "No";
+
+  return `Quantum Scan (${type})
+${a.ticker}  $${px}  ${chg}%
+RVOL: ${rvol}x   Float: ${flt}
+News: ${news}`;
+}
+
+async function sendTelegramAlert(alertRow) {
+  await sendTelegram(formatAlertText(alertRow));
+}
+
+// =========================
 // POLYGON HELPERS + CACHES
 // =========================
 const cache = {
-  avgVol: new Map(), // ticker -> { value, expiresAt }
-  float: new Map(), // ticker -> { value, expiresAt }
-  news: new Map(), // ticker -> { value, expiresAt }
-  spike: new Map(), // ticker -> { value, expiresAt }  (NEW)
+  avgVol: new Map(),
+  float: new Map(),
+  news: new Map(),
 };
 
 function getCache(map, key) {
@@ -316,15 +338,11 @@ async function polygonJson(url) {
   return resp.json();
 }
 
-/**
- * Fetch ALL pages of the snapshot tickers endpoint if Polygon paginates.
- * Polygon often returns `next_url`. We keep following it.
- */
 async function fetchAllSnapshotTickers() {
   let all = [];
-  let url = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey=${POLYGON_KEY}`;
+  let url =
+    `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey=${POLYGON_KEY}`;
 
-  // Safety: stop runaway pagination
   const MAX_PAGES = 20;
 
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -335,7 +353,6 @@ async function fetchAllSnapshotTickers() {
     const nextUrl = data?.next_url;
     if (!nextUrl) break;
 
-    // Polygon next_url sometimes lacks apiKey; add it if missing.
     url = nextUrl.includes("apiKey=")
       ? nextUrl
       : `${nextUrl}${nextUrl.includes("?") ? "&" : "?"}apiKey=${POLYGON_KEY}`;
@@ -344,9 +361,6 @@ async function fetchAllSnapshotTickers() {
   return all;
 }
 
-/**
- * 30-day average daily volume (Aggs)
- */
 async function getAvgDailyVolume(ticker) {
   const cached = getCache(cache.avgVol, ticker);
   if (cached != null) return cached;
@@ -376,13 +390,10 @@ async function getAvgDailyVolume(ticker) {
   }
 
   const avg = Math.round(vols.reduce((a, b) => a + b, 0) / vols.length);
-  setCache(cache.avgVol, ticker, avg, 6 * 60 * 60 * 1000); // 6 hours
+  setCache(cache.avgVol, ticker, avg, 6 * 60 * 60 * 1000);
   return avg;
 }
 
-/**
- * Shares/float-ish (best available)
- */
 async function getFloatOrSharesOutstanding(ticker) {
   const cached = getCache(cache.float, ticker);
   if (cached != null) return cached;
@@ -400,13 +411,10 @@ async function getFloatOrSharesOutstanding(ticker) {
     Number(res?.weighted_shares_outstanding) ||
     0;
 
-  setCache(cache.float, ticker, floatLike, 24 * 60 * 60 * 1000); // 24 hours
+  setCache(cache.float, ticker, floatLike, 24 * 60 * 60 * 1000);
   return floatLike;
 }
 
-/**
- * News catalyst: any news within lookback minutes
- */
 async function hasRecentNews(ticker) {
   const cached = getCache(cache.news, ticker);
   if (cached != null) return cached;
@@ -426,90 +434,34 @@ async function hasRecentNews(ticker) {
     const results = Array.isArray(data?.results) ? data.results : [];
     ok = results.length > 0;
   } catch (e) {
-    console.error(`News check failed for ${ticker}:`, e.message);
     ok = false;
   }
 
-  setCache(cache.news, ticker, ok, 5 * 60 * 1000); // 5 minutes
+  setCache(cache.news, ticker, ok, 5 * 60 * 1000);
   return ok;
 }
 
-/**
- * NEW: Volume spike detector using 1-minute aggs.
- *
- * Logic:
- * - last N minutes volume (N = VOLUME_LOOKBACK_MIN)
- * - compare to baseline average per-minute volume from the prior window
- *   (baseline = VOLUME_BASELINE_MIN minutes immediately before the last N minutes)
- *
- * Trigger if:
- *   volLastN >= multiplier * (avgBaselinePerMin * N)
- */
-async function hasVolumeSpike(ticker) {
-  const cached = getCache(cache.spike, ticker);
-  if (cached != null) return cached;
+// Minute bars for runner spike detection
+async function getMinuteBars(ticker, minutesBack) {
+  const to = new Date();
+  const from = new Date(Date.now() - minutesBack * 60 * 1000);
 
-  // protect against weird config
-  const lookback = Math.max(1, VOLUME_LOOKBACK_MIN);
-  const baseline = Math.max(5, VOLUME_BASELINE_MIN);
-
-  const now = Date.now();
-  const totalMinutes = lookback + baseline;
-
-  // Polygon minute aggs use millisecond timestamps; we can just use "from/to" ISO dates in URL.
-  // We'll request a recent window by using UTC dates; Polygon returns minute bars across that range.
-  const to = new Date(now).toISOString().slice(0, 10);
-  const from = new Date(now - totalMinutes * 60 * 1000 - 10 * 60 * 1000).toISOString().slice(0, 10);
+  const toStr = to.toISOString();
+  const fromStr = from.toISOString();
 
   const url =
     `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}` +
-    `/range/1/minute/${from}/${to}?adjusted=true&sort=asc&limit=50000&apiKey=${POLYGON_KEY}`;
+    `/range/1/minute/${encodeURIComponent(fromStr)}/${encodeURIComponent(toStr)}` +
+    `?adjusted=true&sort=asc&limit=50000&apiKey=${POLYGON_KEY}`;
 
-  let spike = false;
-
-  try {
-    spikeChecks += 1;
-    const data = await polygonJson(url);
-    const results = Array.isArray(data?.results) ? data.results : [];
-    if (results.length < (lookback + Math.floor(baseline / 2))) {
-      setCache(cache.spike, ticker, false, 60 * 1000);
-      return false;
-    }
-
-    // Keep only bars from last totalMinutes minutes (by timestamp)
-    const cutoff = now - totalMinutes * 60 * 1000;
-    const recent = results.filter((r) => Number(r?.t || 0) >= cutoff);
-
-    if (recent.length < lookback + Math.floor(baseline / 2)) {
-      setCache(cache.spike, ticker, false, 60 * 1000);
-      return false;
-    }
-
-    // Split: last lookback minutes vs baseline minutes preceding them
-    const lastN = recent.slice(-lookback);
-    const prev = recent.slice(-(lookback + baseline), -lookback);
-
-    const volLastN = lastN.reduce((sum, r) => sum + Number(r?.v || 0), 0);
-    const volPrev = prev.reduce((sum, r) => sum + Number(r?.v || 0), 0);
-
-    const avgPrevPerMin = volPrev / Math.max(1, prev.length);
-    const expected = avgPrevPerMin * lookback;
-
-    spike = expected > 0 && volLastN >= VOLUME_SPIKE_MULTIPLIER * expected;
-
-    setCache(cache.spike, ticker, spike, 60 * 1000); // 1 minute cache
-    return spike;
-  } catch (e) {
-    console.error(`Spike check failed for ${ticker}:`, e.message);
-    setCache(cache.spike, ticker, false, 60 * 1000);
-    return false;
-  }
+  const data = await polygonJson(url);
+  return Array.isArray(data?.results) ? data.results : [];
 }
 
 // =========================
-// SCANNER LOOP
+// COOLdown + concurrency
 // =========================
-const cooldownMap = new Map(); // ticker -> expiresAt
+const cooldownMap = new Map();
 
 function inCooldown(ticker) {
   const exp = cooldownMap.get(ticker);
@@ -525,9 +477,6 @@ function setCooldown(ticker) {
   cooldownMap.set(ticker, Date.now() + ALERT_COOLDOWN_MIN * 60 * 1000);
 }
 
-/**
- * Simple concurrency limiter (no extra libs)
- */
 async function runWithConcurrency(items, limit, workerFn) {
   const results = [];
   let idx = 0;
@@ -544,6 +493,27 @@ async function runWithConcurrency(items, limit, workerFn) {
   return results;
 }
 
+// =========================
+// Time helpers (premarket)
+// =========================
+function isPremarketET(now = new Date()) {
+  // Premarket: 4:00 AM ET to 9:29 AM ET
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const parts = fmt.formatToParts(now);
+  const hh = Number(parts.find(p => p.type === "hour")?.value || 0);
+  const mm = Number(parts.find(p => p.type === "minute")?.value || 0);
+  const mins = hh * 60 + mm;
+  return mins >= 4 * 60 && mins < 9 * 60 + 30;
+}
+
+// =========================
+// SCAN LOOP
+// =========================
 async function scan() {
   lastLoopAt = new Date().toISOString();
   if (isScanning) return;
@@ -555,58 +525,90 @@ async function scan() {
   lastError = null;
   lastScanStartedAt = new Date().toISOString();
 
-  // reset per-run counters
   tickersFetched = 0;
   candidatesFound = 0;
   deepChecked = 0;
   alertsCreated = 0;
-  earlyCandidates = 0;
-  spikeChecks = 0;
+  premarketCandidates = 0;
+  runnerCandidates = 0;
+  runnerChecked = 0;
 
   try {
     console.log("Scanning market...");
 
-    // 1) Pull snapshot tickers (market-wide)
     const tickers = await fetchAllSnapshotTickers();
     tickersFetched = tickers.length;
 
-    // 2) Cheap prefilter using snapshot data (fast, no extra API calls)
-    // NEW: allow "early" percent window into deep-check pool
-    let candidates = tickers
+    const mapped = tickers
       .map((t) => {
         const symbol = t?.ticker;
         const price = Number(t?.lastTrade?.p || 0);
         const percentChange = Number(t?.todaysChangePerc || 0);
         const dayVol = Number(t?.day?.v || 0);
-        return { symbol, price, percentChange, dayVol };
+        const prevClose = Number(t?.prevDay?.c || 0);
+        return { symbol, price, percentChange, dayVol, prevClose };
       })
-      .filter((t) => t.symbol && t.price >= PRICE_MIN && t.price <= PRICE_MAX)
-      .filter(
-        (t) =>
-          t.percentChange >= MIN_PERCENT_CHANGE ||
-          t.percentChange >= EARLY_MIN_PERCENT_CHANGE
-      )
+      .filter((t) => t.symbol && t.price > 0);
+
+    // --- Premarket gappers list (fast prefilter) ---
+    const premarketNow = PREMARKET_ENABLED && isPremarketET(new Date());
+    let premarketList = [];
+    if (premarketNow) {
+      premarketList = mapped
+        .filter((t) => t.price >= PRICE_MIN && t.price <= PRICE_MAX)
+        .filter((t) => t.percentChange >= PREMARKET_MIN_GAP)
+        .filter((t) => t.dayVol >= PREMARKET_MIN_VOL)
+        .sort((a, b) => b.percentChange - a.percentChange);
+
+      premarketCandidates = premarketList.length;
+      if (MAX_CANDIDATES > 0) premarketList = premarketList.slice(0, MAX_CANDIDATES);
+    }
+
+    // --- Normal scan candidates (fast prefilter) ---
+    let candidates = mapped
+      .filter((t) => t.price >= PRICE_MIN && t.price <= PRICE_MAX)
+      .filter((t) => t.percentChange >= MIN_PERCENT_CHANGE)
       .sort((a, b) => b.dayVol - a.dayVol);
 
     candidatesFound = candidates.length;
+    if (MAX_CANDIDATES > 0) candidates = candidates.slice(0, MAX_CANDIDATES);
 
-    // Optional cap to protect rate limits for deep checks
-    if (MAX_CANDIDATES > 0) {
-      candidates = candidates.slice(0, MAX_CANDIDATES);
+    // --- Runner candidates (fast prefilter) ---
+    let runnerList = [];
+    if (RUNNER_ENABLED) {
+      runnerList = mapped
+        .filter((t) => t.price >= PRICE_MIN && t.price <= PRICE_MAX)
+        .filter((t) => t.percentChange >= EARLY_MIN_PERCENT_CHANGE)
+        .filter((t) => t.dayVol >= RUNNER_MIN_VOL)
+        .sort((a, b) => b.dayVol - a.dayVol);
+
+      runnerCandidates = runnerList.length;
+      // keep runner checks small to reduce API cost
+      runnerList = runnerList.slice(0, Math.min(80, MAX_CANDIDATES > 0 ? MAX_CANDIDATES : 80));
     }
 
-    earlyCandidates = candidates.filter(
-      (c) => c.percentChange < MIN_PERCENT_CHANGE && c.percentChange >= EARLY_MIN_PERCENT_CHANGE
-    ).length;
-
     console.log(
-      `Tickers fetched: ${tickersFetched} | Candidates (prefilter): ${candidatesFound} | Deep-checking: ${candidates.length}`
+      `Tickers: ${tickersFetched} | Scan candidates: ${candidates.length} | Premarket: ${premarketList.length} | Runners: ${runnerList.length}`
     );
 
-    // 3) Deep checks (expensive endpoints) on limited set
-    await runWithConcurrency(candidates, CONCURRENCY, async (c) => {
-      const ticker = c.symbol;
+    // Merge lists with a tag (so we know what triggered it)
+    const work = [
+      ...premarketList.map(x => ({ ...x, mode: "PREMARKET" })),
+      ...candidates.map(x => ({ ...x, mode: "SCAN" })),
+      ...runnerList.map(x => ({ ...x, mode: "RUNNER" })),
+    ];
 
+    // Deduplicate by symbol, prioritize PREMARKET > SCAN > RUNNER
+    const rank = { PREMARKET: 3, SCAN: 2, RUNNER: 1 };
+    const bySymbol = new Map();
+    for (const item of work) {
+      const prev = bySymbol.get(item.symbol);
+      if (!prev || rank[item.mode] > rank[prev.mode]) bySymbol.set(item.symbol, item);
+    }
+    const jobs = Array.from(bySymbol.values());
+
+    await runWithConcurrency(jobs, CONCURRENCY, async (c) => {
+      const ticker = c.symbol;
       try {
         if (inCooldown(ticker)) return;
 
@@ -618,55 +620,116 @@ async function scan() {
 
         deepChecked += 1;
 
-        // NEW: if we're below the main % threshold, require a volume spike first
-        const isEarlyWindow =
-          c.percentChange < MIN_PERCENT_CHANGE &&
-          c.percentChange >= EARLY_MIN_PERCENT_CHANGE;
-
-        if (isEarlyWindow) {
-          const spikeOk = await hasVolumeSpike(ticker);
-          if (!spikeOk) return;
-        }
-
-        // 1) RVOL = today volume / avg daily volume
-        const avgVol = await getAvgDailyVolume(ticker);
-        if (!avgVol || avgVol <= 0) return;
-
-        const rvol = c.dayVol / avgVol;
-        if (rvol < MIN_RVOL) return;
-
-        // 2) News catalyst
-        const newsOk = await hasRecentNews(ticker);
-        if (!newsOk) return;
-
-        // 3) Float/shares <= MAX_FLOAT
+        // Float check first (fast-ish; cached)
         const floatVal = await getFloatOrSharesOutstanding(ticker);
         if (!floatVal || floatVal <= 0) return;
         if (floatVal > MAX_FLOAT) return;
 
-        // ✅ PASSES ALL 5 (+ early spike gate when needed)
-        const alertPayload = {
-          ticker,
-          price: c.price,
-          percent_change: c.percentChange,
-          rvol: Number(rvol.toFixed(2)),
-          float: Math.round(floatVal),
-          news: true,
-          // optional debug field for your own logging:
-          early: isEarlyWindow,
-        };
+        // News check (cached)
+        const newsOk = await hasRecentNews(ticker);
 
-        await insertAlert(alertPayload);
-        await pushToBase44(alertPayload);
+        // RVOL check (normal scan & premarket should use it)
+        const avgVol = await getAvgDailyVolume(ticker);
+        if (!avgVol || avgVol <= 0) return;
 
-        alertsCreated += 1;
-        setCooldown(ticker);
+        const rvol = c.dayVol / avgVol;
 
-        console.log(
-          `ALERT: ${ticker} price=${c.price.toFixed(2)} change=${c.percentChange.toFixed(
-            2
-          )}% rvol=${rvol.toFixed(2)} float=${Math.round(floatVal)} news=true early=${isEarlyWindow}`
-        );
+        // ---- MODE RULES ----
+        if (c.mode === "SCAN") {
+          if (rvol < MIN_RVOL) return;
+          // require news for SCAN? keep it required by default behavior (you can change later)
+          if (!newsOk) return;
+
+          const payload = {
+            ticker,
+            price: c.price,
+            percent_change: c.percentChange,
+            rvol: Number(rvol.toFixed(2)),
+            float: Math.round(floatVal),
+            news: true,
+            alert_type: "SCAN",
+            meta: JSON.stringify({ mode: "SCAN" }),
+          };
+
+          const row = await insertAlert(payload);
+          await pushToBase44(row);
+          await sendTelegramAlert(row);
+
+          alertsCreated += 1;
+          setCooldown(ticker);
+          console.log(`ALERT(SCAN): ${ticker} $${c.price} chg=${c.percentChange}% rvol=${rvol.toFixed(2)} float=${Math.round(floatVal)} news=true`);
+          return;
+        }
+
+        if (c.mode === "PREMARKET") {
+          // premarket gappers: allow no-news if configured
+          if (rvol < MIN_RVOL) return;
+          if (PREMARKET_REQUIRE_NEWS && !newsOk) return;
+
+          const payload = {
+            ticker,
+            price: c.price,
+            percent_change: c.percentChange,
+            rvol: Number(rvol.toFixed(2)),
+            float: Math.round(floatVal),
+            news: Boolean(newsOk),
+            alert_type: "GAPPER",
+            meta: JSON.stringify({ mode: "PREMARKET" }),
+          };
+
+          const row = await insertAlert(payload);
+          await pushToBase44(row);
+          await sendTelegramAlert(row);
+
+          alertsCreated += 1;
+          setCooldown(ticker);
+          console.log(`ALERT(GAPPER): ${ticker} $${c.price} chg=${c.percentChange}% rvol=${rvol.toFixed(2)} float=${Math.round(floatVal)} news=${newsOk}`);
+          return;
+        }
+
+        if (c.mode === "RUNNER") {
+          // runners: volume spike ignition (does NOT require news)
+          runnerChecked += 1;
+
+          // quick minute-bars spike check
+          const bars = await getMinuteBars(ticker, Math.max(VOLUME_BASELINE_MIN, VOLUME_LOOKBACK_MIN) + 2);
+          if (!bars || bars.length < (VOLUME_LOOKBACK_MIN + 2)) return;
+
+          const vols = bars.map(b => Number(b?.v || 0)).filter(v => Number.isFinite(v));
+          if (vols.length < (VOLUME_LOOKBACK_MIN + 2)) return;
+
+          // baseline = average of older part of window
+          const baselineWindow = vols.slice(0, Math.max(1, vols.length - VOLUME_LOOKBACK_MIN));
+          const baselineAvg = baselineWindow.reduce((a,b)=>a+b,0) / Math.max(1, baselineWindow.length);
+
+          const recentWindow = vols.slice(-VOLUME_LOOKBACK_MIN);
+          const recentAvg = recentWindow.reduce((a,b)=>a+b,0) / Math.max(1, recentWindow.length);
+
+          if (baselineAvg <= 0) return;
+          const spike = recentAvg / baselineAvg;
+
+          if (spike < VOLUME_SPIKE_MULTIPLIER) return;
+
+          const payload = {
+            ticker,
+            price: c.price,
+            percent_change: c.percentChange,
+            rvol: Number(rvol.toFixed(2)),
+            float: Math.round(floatVal),
+            news: Boolean(newsOk),
+            alert_type: "RUNNER",
+            meta: JSON.stringify({ mode: "RUNNER", spike: Number(spike.toFixed(2)) }),
+          };
+
+          const row = await insertAlert(payload);
+          await pushToBase44(row);
+          await sendTelegramAlert(row);
+
+          alertsCreated += 1;
+          setCooldown(ticker);
+          console.log(`ALERT(RUNNER): ${ticker} $${c.price} chg=${c.percentChange}% spike=${spike.toFixed(2)} rvol=${rvol.toFixed(2)} float=${Math.round(floatVal)}`);
+          return;
+        }
       } catch (e) {
         console.error(`Ticker check error (${ticker}):`, e.message);
       }
@@ -690,23 +753,8 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port", PORT);
   console.log("Scan interval (ms):", SCAN_INTERVAL_MS);
-  console.log("Criteria:", {
-    PRICE_MIN,
-    PRICE_MAX,
-    MIN_PERCENT_CHANGE,
-    EARLY_MIN_PERCENT_CHANGE,
-    MIN_RVOL,
-    MAX_FLOAT,
-    AVG_VOL_DAYS,
-    NEWS_LOOKBACK_MIN,
-    ALERT_COOLDOWN_MIN,
-    MAX_CANDIDATES,
-    CONCURRENCY,
-    VOLUME_SPIKE_MULTIPLIER,
-    VOLUME_LOOKBACK_MIN,
-    VOLUME_BASELINE_MIN,
-    BASE44_ENABLED: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
-  });
+  console.log("Telegram enabled:", TELEGRAM_ENABLED);
+  console.log("Base44 enabled:", Boolean(BASE44_INGEST_URL && BASE44_API_KEY));
 });
 
 scan();
