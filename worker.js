@@ -21,13 +21,11 @@ if (typeof fetch !== "function") {
  * BASE44_INGEST_URL=https://quantum-scan-pro.base44.app/api/functions/ingestAlert
  * BASE44_API_KEY=xxxxxxxxxxxxxxxx
  *
- * TELEGRAM_BOT_TOKEN=123456:AA....
- * TELEGRAM_CHAT_ID=7974446259
- *
  * SCAN_INTERVAL_MS=60000
- * PRICE_MIN=0.5
- * PRICE_MAX=40
+ * PRICE_MIN=2
+ * PRICE_MAX=20
  * MIN_PERCENT_CHANGE=10
+ * EARLY_MIN_PERCENT_CHANGE=3         <-- NEW (recommended)
  * MIN_RVOL=5
  * MAX_FLOAT=5000000
  * AVG_VOL_DAYS=30
@@ -35,6 +33,10 @@ if (typeof fetch !== "function") {
  * ALERT_COOLDOWN_MIN=30
  * MAX_CANDIDATES=300          (0 or negative = no cap)
  * CONCURRENCY=4
+ *
+ * VOLUME_SPIKE_MULTIPLIER=3          <-- NEW (you already added)
+ * VOLUME_LOOKBACK_MIN=5              <-- NEW (you already added)
+ * VOLUME_BASELINE_MIN=30             <-- OPTIONAL (defaults to 30)
  */
 
 const POLYGON_KEY = process.env.POLYGON_KEY;
@@ -42,10 +44,6 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 const BASE44_INGEST_URL = process.env.BASE44_INGEST_URL || "";
 const BASE44_API_KEY = process.env.BASE44_API_KEY || "";
-
-// Telegram (optional)
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
 if (!POLYGON_KEY) console.error("Missing env var: POLYGON_KEY");
 if (!DATABASE_URL) console.error("Missing env var: DATABASE_URL");
@@ -55,7 +53,9 @@ const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 60000);
 
 const PRICE_MIN = Number(process.env.PRICE_MIN || 2);
 const PRICE_MAX = Number(process.env.PRICE_MAX || 20);
+
 const MIN_PERCENT_CHANGE = Number(process.env.MIN_PERCENT_CHANGE || 10);
+const EARLY_MIN_PERCENT_CHANGE = Number(process.env.EARLY_MIN_PERCENT_CHANGE || 3);
 
 const MIN_RVOL = Number(process.env.MIN_RVOL || 5);
 const MAX_FLOAT = Number(process.env.MAX_FLOAT || 5000000);
@@ -67,6 +67,11 @@ const ALERT_COOLDOWN_MIN = Number(process.env.ALERT_COOLDOWN_MIN || 30);
 
 const MAX_CANDIDATES = Number(process.env.MAX_CANDIDATES || 300);
 const CONCURRENCY = Number(process.env.CONCURRENCY || 4);
+
+// ===== Volume spike detection (NEW) =====
+const VOLUME_SPIKE_MULTIPLIER = Number(process.env.VOLUME_SPIKE_MULTIPLIER || 3);
+const VOLUME_LOOKBACK_MIN = Number(process.env.VOLUME_LOOKBACK_MIN || 5);
+const VOLUME_BASELINE_MIN = Number(process.env.VOLUME_BASELINE_MIN || 30);
 
 // ===== Postgres pool (Railway typically needs ssl rejectUnauthorized false) =====
 const pool = new Pool({
@@ -95,6 +100,9 @@ let deepChecked = 0; // how many we ran expensive checks on
 let alertsCreated = 0; // how many alerts inserted (per scan)
 let scanRuns = 0;
 
+let earlyCandidates = 0; // how many got into deep-check due to early trigger window
+let spikeChecks = 0; // how many volume spike checks performed
+
 // =========================
 // ROUTES
 // =========================
@@ -118,16 +126,34 @@ app.get("/health", async (req, res) => {
       lastScanFinishedAt,
       lastScanDurationMs,
 
+      // criteria
+      PRICE_MIN,
+      PRICE_MAX,
+      MIN_PERCENT_CHANGE,
+      EARLY_MIN_PERCENT_CHANGE,
+      MIN_RVOL,
+      MAX_FLOAT,
+      AVG_VOL_DAYS,
+      NEWS_LOOKBACK_MIN,
+      ALERT_COOLDOWN_MIN,
+      MAX_CANDIDATES,
+      CONCURRENCY,
+
+      // volume spike
+      VOLUME_SPIKE_MULTIPLIER,
+      VOLUME_LOOKBACK_MIN,
+      VOLUME_BASELINE_MIN,
+
       // counts
       tickersFetched,
       candidatesFound,
+      earlyCandidates,
+      spikeChecks,
       deepChecked,
       alertsCreated,
       scanRuns,
 
-      // integrations
       base44Enabled: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
-      telegramEnabled: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
     });
   } catch (e) {
     res.status(500).json({
@@ -143,11 +169,12 @@ app.get("/health", async (req, res) => {
       lastScanDurationMs,
       tickersFetched,
       candidatesFound,
+      earlyCandidates,
+      spikeChecks,
       deepChecked,
       alertsCreated,
       scanRuns,
       base44Enabled: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
-      telegramEnabled: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
     });
   }
 });
@@ -185,17 +212,6 @@ app.get("/test", async (req, res) => {
       float: inserted.float,
       news: inserted.news,
     });
-
-    await sendTelegramMessage(
-      `✅ Quantum Scan TEST alert\n` +
-        `${inserted.ticker}  $${Number(inserted.price).toFixed(2)}  (${Number(
-          inserted.percent_change
-        ).toFixed(2)}%)\n` +
-        `RVOL: ${Number(inserted.rvol).toFixed(2)}  Float: ${Number(
-          inserted.float
-        ).toLocaleString()}\n` +
-        `News: ✅`
-    );
 
     res.json({ success: true, alert: inserted });
   } catch (err) {
@@ -268,39 +284,13 @@ async function pushToBase44(alert) {
 }
 
 // =========================
-// TELEGRAM PUSH (optional)
-// =========================
-async function sendTelegramMessage(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-
-  try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text,
-        disable_web_page_preview: true,
-      }),
-    });
-
-    if (!resp.ok) {
-      const t = await resp.text().catch(() => "");
-      console.error("Telegram send failed:", resp.status, t.slice(0, 200));
-    }
-  } catch (e) {
-    console.error("Telegram error:", e.message);
-  }
-}
-
-// =========================
 // POLYGON HELPERS + CACHES
 // =========================
 const cache = {
   avgVol: new Map(), // ticker -> { value, expiresAt }
   float: new Map(), // ticker -> { value, expiresAt }
   news: new Map(), // ticker -> { value, expiresAt }
+  spike: new Map(), // ticker -> { value, expiresAt }  (NEW)
 };
 
 function getCache(map, key) {
@@ -444,6 +434,78 @@ async function hasRecentNews(ticker) {
   return ok;
 }
 
+/**
+ * NEW: Volume spike detector using 1-minute aggs.
+ *
+ * Logic:
+ * - last N minutes volume (N = VOLUME_LOOKBACK_MIN)
+ * - compare to baseline average per-minute volume from the prior window
+ *   (baseline = VOLUME_BASELINE_MIN minutes immediately before the last N minutes)
+ *
+ * Trigger if:
+ *   volLastN >= multiplier * (avgBaselinePerMin * N)
+ */
+async function hasVolumeSpike(ticker) {
+  const cached = getCache(cache.spike, ticker);
+  if (cached != null) return cached;
+
+  // protect against weird config
+  const lookback = Math.max(1, VOLUME_LOOKBACK_MIN);
+  const baseline = Math.max(5, VOLUME_BASELINE_MIN);
+
+  const now = Date.now();
+  const totalMinutes = lookback + baseline;
+
+  // Polygon minute aggs use millisecond timestamps; we can just use "from/to" ISO dates in URL.
+  // We'll request a recent window by using UTC dates; Polygon returns minute bars across that range.
+  const to = new Date(now).toISOString().slice(0, 10);
+  const from = new Date(now - totalMinutes * 60 * 1000 - 10 * 60 * 1000).toISOString().slice(0, 10);
+
+  const url =
+    `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}` +
+    `/range/1/minute/${from}/${to}?adjusted=true&sort=asc&limit=50000&apiKey=${POLYGON_KEY}`;
+
+  let spike = false;
+
+  try {
+    spikeChecks += 1;
+    const data = await polygonJson(url);
+    const results = Array.isArray(data?.results) ? data.results : [];
+    if (results.length < (lookback + Math.floor(baseline / 2))) {
+      setCache(cache.spike, ticker, false, 60 * 1000);
+      return false;
+    }
+
+    // Keep only bars from last totalMinutes minutes (by timestamp)
+    const cutoff = now - totalMinutes * 60 * 1000;
+    const recent = results.filter((r) => Number(r?.t || 0) >= cutoff);
+
+    if (recent.length < lookback + Math.floor(baseline / 2)) {
+      setCache(cache.spike, ticker, false, 60 * 1000);
+      return false;
+    }
+
+    // Split: last lookback minutes vs baseline minutes preceding them
+    const lastN = recent.slice(-lookback);
+    const prev = recent.slice(-(lookback + baseline), -lookback);
+
+    const volLastN = lastN.reduce((sum, r) => sum + Number(r?.v || 0), 0);
+    const volPrev = prev.reduce((sum, r) => sum + Number(r?.v || 0), 0);
+
+    const avgPrevPerMin = volPrev / Math.max(1, prev.length);
+    const expected = avgPrevPerMin * lookback;
+
+    spike = expected > 0 && volLastN >= VOLUME_SPIKE_MULTIPLIER * expected;
+
+    setCache(cache.spike, ticker, spike, 60 * 1000); // 1 minute cache
+    return spike;
+  } catch (e) {
+    console.error(`Spike check failed for ${ticker}:`, e.message);
+    setCache(cache.spike, ticker, false, 60 * 1000);
+    return false;
+  }
+}
+
 // =========================
 // SCANNER LOOP
 // =========================
@@ -498,6 +560,8 @@ async function scan() {
   candidatesFound = 0;
   deepChecked = 0;
   alertsCreated = 0;
+  earlyCandidates = 0;
+  spikeChecks = 0;
 
   try {
     console.log("Scanning market...");
@@ -507,6 +571,7 @@ async function scan() {
     tickersFetched = tickers.length;
 
     // 2) Cheap prefilter using snapshot data (fast, no extra API calls)
+    // NEW: allow "early" percent window into deep-check pool
     let candidates = tickers
       .map((t) => {
         const symbol = t?.ticker;
@@ -516,7 +581,11 @@ async function scan() {
         return { symbol, price, percentChange, dayVol };
       })
       .filter((t) => t.symbol && t.price >= PRICE_MIN && t.price <= PRICE_MAX)
-      .filter((t) => t.percentChange >= MIN_PERCENT_CHANGE)
+      .filter(
+        (t) =>
+          t.percentChange >= MIN_PERCENT_CHANGE ||
+          t.percentChange >= EARLY_MIN_PERCENT_CHANGE
+      )
       .sort((a, b) => b.dayVol - a.dayVol);
 
     candidatesFound = candidates.length;
@@ -525,6 +594,10 @@ async function scan() {
     if (MAX_CANDIDATES > 0) {
       candidates = candidates.slice(0, MAX_CANDIDATES);
     }
+
+    earlyCandidates = candidates.filter(
+      (c) => c.percentChange < MIN_PERCENT_CHANGE && c.percentChange >= EARLY_MIN_PERCENT_CHANGE
+    ).length;
 
     console.log(
       `Tickers fetched: ${tickersFetched} | Candidates (prefilter): ${candidatesFound} | Deep-checking: ${candidates.length}`
@@ -545,6 +618,16 @@ async function scan() {
 
         deepChecked += 1;
 
+        // NEW: if we're below the main % threshold, require a volume spike first
+        const isEarlyWindow =
+          c.percentChange < MIN_PERCENT_CHANGE &&
+          c.percentChange >= EARLY_MIN_PERCENT_CHANGE;
+
+        if (isEarlyWindow) {
+          const spikeOk = await hasVolumeSpike(ticker);
+          if (!spikeOk) return;
+        }
+
         // 1) RVOL = today volume / avg daily volume
         const avgVol = await getAvgDailyVolume(ticker);
         if (!avgVol || avgVol <= 0) return;
@@ -556,12 +639,12 @@ async function scan() {
         const newsOk = await hasRecentNews(ticker);
         if (!newsOk) return;
 
-        // 3) Float/shares <= 5M
+        // 3) Float/shares <= MAX_FLOAT
         const floatVal = await getFloatOrSharesOutstanding(ticker);
         if (!floatVal || floatVal <= 0) return;
         if (floatVal > MAX_FLOAT) return;
 
-        // ✅ PASSES ALL 5
+        // ✅ PASSES ALL 5 (+ early spike gate when needed)
         const alertPayload = {
           ticker,
           price: c.price,
@@ -569,18 +652,12 @@ async function scan() {
           rvol: Number(rvol.toFixed(2)),
           float: Math.round(floatVal),
           news: true,
+          // optional debug field for your own logging:
+          early: isEarlyWindow,
         };
 
         await insertAlert(alertPayload);
         await pushToBase44(alertPayload);
-
-        // Telegram notification (optional)
-        await sendTelegramMessage(
-          `🚨 Quantum Scan Alert\n` +
-            `${ticker}  $${c.price.toFixed(2)}  (${c.percentChange.toFixed(2)}%)\n` +
-            `RVOL: ${rvol.toFixed(2)}  Float: ${Math.round(floatVal).toLocaleString()}\n` +
-            `News: ✅`
-        );
 
         alertsCreated += 1;
         setCooldown(ticker);
@@ -588,7 +665,7 @@ async function scan() {
         console.log(
           `ALERT: ${ticker} price=${c.price.toFixed(2)} change=${c.percentChange.toFixed(
             2
-          )}% rvol=${rvol.toFixed(2)} float=${Math.round(floatVal)} news=true`
+          )}% rvol=${rvol.toFixed(2)} float=${Math.round(floatVal)} news=true early=${isEarlyWindow}`
         );
       } catch (e) {
         console.error(`Ticker check error (${ticker}):`, e.message);
@@ -617,6 +694,7 @@ app.listen(PORT, "0.0.0.0", () => {
     PRICE_MIN,
     PRICE_MAX,
     MIN_PERCENT_CHANGE,
+    EARLY_MIN_PERCENT_CHANGE,
     MIN_RVOL,
     MAX_FLOAT,
     AVG_VOL_DAYS,
@@ -624,8 +702,10 @@ app.listen(PORT, "0.0.0.0", () => {
     ALERT_COOLDOWN_MIN,
     MAX_CANDIDATES,
     CONCURRENCY,
+    VOLUME_SPIKE_MULTIPLIER,
+    VOLUME_LOOKBACK_MIN,
+    VOLUME_BASELINE_MIN,
     BASE44_ENABLED: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
-    TELEGRAM_ENABLED: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
 });
 
