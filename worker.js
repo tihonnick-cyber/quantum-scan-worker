@@ -31,20 +31,22 @@ if (typeof fetch !== "function") {
  * - CONCURRENCY=4
  * - NEWS_LOOKBACK_MIN=1440
  *
- * Runner (regular movers):
+ * Runner:
  * - RUNNER_ENABLED=true
- * - MIN_PERCENT_CHANGE=10
- * - MIN_RVOL=5
- * - RUNNER_MIN_VOL=200000
+ * - RUNNER_REQUIRE_NEWS=false
+ * - MIN_PERCENT_CHANGE=5
+ * - MIN_RVOL=3
+ * - RUNNER_MIN_VOL=100000
  *
  * Premarket gappers:
  * - PREMARKET_ENABLED=true
- * - PREMARKET_MIN_GAP=7
- * - PREMARKET_MIN_VOL=20000
+ * - PREMARKET_MIN_GAP=5
+ * - PREMARKET_MIN_VOL=10000
  * - PREMARKET_REQUIRE_NEWS=false
+ * - PREMARKET_REQUIRE_SPIKE=false
  *
- * Volume spike detector:
- * - VOLUME_SPIKE_MULTIPLIER=3
+ * Volume spike:
+ * - VOLUME_SPIKE_MULTIPLIER=2
  * - VOLUME_LOOKBACK_MIN=5
  * - VOLUME_BASELINE_MIN=30
  */
@@ -78,18 +80,20 @@ const NEWS_LOOKBACK_MIN = Number(process.env.NEWS_LOOKBACK_MIN || 1440);
 
 // Runner
 const RUNNER_ENABLED = String(process.env.RUNNER_ENABLED || "true") === "true";
-const MIN_PERCENT_CHANGE = Number(process.env.MIN_PERCENT_CHANGE || 10);
-const MIN_RVOL = Number(process.env.MIN_RVOL || 5);
-const RUNNER_MIN_VOL = Number(process.env.RUNNER_MIN_VOL || 200000);
+const RUNNER_REQUIRE_NEWS = String(process.env.RUNNER_REQUIRE_NEWS || "false") === "true";
+const MIN_PERCENT_CHANGE = Number(process.env.MIN_PERCENT_CHANGE || 5);
+const MIN_RVOL = Number(process.env.MIN_RVOL || 3);
+const RUNNER_MIN_VOL = Number(process.env.RUNNER_MIN_VOL || 100000);
 
 // Premarket gappers
 const PREMARKET_ENABLED = String(process.env.PREMARKET_ENABLED || "true") === "true";
-const PREMARKET_MIN_GAP = Number(process.env.PREMARKET_MIN_GAP || 7);
-const PREMARKET_MIN_VOL = Number(process.env.PREMARKET_MIN_VOL || 20000);
+const PREMARKET_MIN_GAP = Number(process.env.PREMARKET_MIN_GAP || 5);
+const PREMARKET_MIN_VOL = Number(process.env.PREMARKET_MIN_VOL || 10000);
 const PREMARKET_REQUIRE_NEWS = String(process.env.PREMARKET_REQUIRE_NEWS || "false") === "true";
+const PREMARKET_REQUIRE_SPIKE = String(process.env.PREMARKET_REQUIRE_SPIKE || "false") === "true";
 
 // Volume spike
-const VOLUME_SPIKE_MULTIPLIER = Number(process.env.VOLUME_SPIKE_MULTIPLIER || 3);
+const VOLUME_SPIKE_MULTIPLIER = Number(process.env.VOLUME_SPIKE_MULTIPLIER || 2);
 const VOLUME_LOOKBACK_MIN = Number(process.env.VOLUME_LOOKBACK_MIN || 5);
 const VOLUME_BASELINE_MIN = Number(process.env.VOLUME_BASELINE_MIN || 30);
 
@@ -103,7 +107,7 @@ const pool = new Pool({
 const app = express();
 app.use(express.json());
 
-// ===== runtime state =====
+// ===== Runtime state =====
 let isScanning = false;
 let lastError = null;
 
@@ -121,7 +125,7 @@ let scanRuns = 0;
 let runnerCandidates = 0;
 let gapperCandidates = 0;
 
-// ===== routes =====
+// ===== Routes =====
 app.get("/", (req, res) => res.send("Quantum Scan Worker is running"));
 
 app.get("/health", async (req, res) => {
@@ -157,6 +161,7 @@ app.get("/health", async (req, res) => {
         NEWS_LOOKBACK_MIN,
 
         RUNNER_ENABLED,
+        RUNNER_REQUIRE_NEWS,
         MIN_PERCENT_CHANGE,
         MIN_RVOL,
         RUNNER_MIN_VOL,
@@ -165,6 +170,7 @@ app.get("/health", async (req, res) => {
         PREMARKET_MIN_GAP,
         PREMARKET_MIN_VOL,
         PREMARKET_REQUIRE_NEWS,
+        PREMARKET_REQUIRE_SPIKE,
 
         VOLUME_SPIKE_MULTIPLIER,
         VOLUME_LOOKBACK_MIN,
@@ -172,7 +178,11 @@ app.get("/health", async (req, res) => {
       },
     });
   } catch (e) {
-    res.status(500).json({ ok: false, db: "error", error: e.message });
+    res.status(500).json({
+      ok: false,
+      db: "error",
+      error: e.message,
+    });
   }
 });
 
@@ -188,7 +198,6 @@ app.get("/alerts", async (req, res) => {
   }
 });
 
-// DB + Base44 + Telegram test (inserts TEST row, pushes Base44, pushes Telegram)
 app.get("/test", async (req, res) => {
   try {
     const inserted = await insertAlert({
@@ -203,6 +212,7 @@ app.get("/test", async (req, res) => {
     });
 
     await pushToBase44(inserted);
+    console.log("Sending Telegram for TEST (TEST)");
     await pushToTelegram(formatTelegram(inserted));
 
     res.json({ success: true, alert: inserted });
@@ -212,19 +222,29 @@ app.get("/test", async (req, res) => {
   }
 });
 
-// Telegram-only test (no DB insert)
 app.get("/telegram_test", async (req, res) => {
   try {
-    const msg = `✅ Quantum Scan Telegram test\nTime: ${new Date().toISOString()}\nChat ID: ${TELEGRAM_CHAT_ID || "MISSING"}`;
-    const out = await pushToTelegram(msg, { returnDebug: true });
-    res.json({ ok: true, telegramEnabled: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), result: out });
+    const result = await pushToTelegram(
+      `✅ Quantum Scan Telegram test\nTime: ${new Date().toISOString()}`,
+      { returnDebug: true }
+    );
+    res.json({ ok: true, result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ===== db helpers =====
-async function insertAlert({ ticker, price, percent_change, rvol, float, news, alert_type, meta }) {
+// ===== DB helpers =====
+async function insertAlert({
+  ticker,
+  price,
+  percent_change,
+  rvol,
+  float,
+  news,
+  alert_type,
+  meta,
+}) {
   const result = await pool.query(
     `
     INSERT INTO alerts (
@@ -233,36 +253,49 @@ async function insertAlert({ ticker, price, percent_change, rvol, float, news, a
     VALUES ($1,$2,$3,$4,$5,$6, now(), $7, $8)
     RETURNING *;
     `,
-    [ticker, price, percent_change, rvol, float, news, alert_type || null, meta || null]
+    [
+      ticker,
+      price,
+      percent_change,
+      rvol,
+      float,
+      news,
+      alert_type || null,
+      meta || null,
+    ]
   );
   return result.rows[0];
 }
 
 async function wasAlertedRecently(ticker, alertType) {
-  const minutes = ALERT_COOLDOWN_MIN;
   const result = await pool.query(
     `
     SELECT 1
     FROM alerts
     WHERE ticker = $1
-      AND (alert_type = $2 OR $2 IS NULL OR alert_type IS NULL)
+      AND COALESCE(alert_type, '') = COALESCE($2, '')
       AND created_at >= now() - ($3 || ' minutes')::interval
     LIMIT 1;
     `,
-    [ticker, alertType || null, String(minutes)]
+    [ticker, alertType || null, String(ALERT_COOLDOWN_MIN)]
   );
   return result.rowCount > 0;
 }
 
-// ===== Base44 push =====
+// ===== Base44 =====
 async function pushToBase44(alert) {
   if (!BASE44_INGEST_URL || !BASE44_API_KEY) return;
+
   try {
     const resp = await fetch(BASE44_INGEST_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json", api_key: BASE44_API_KEY },
+      headers: {
+        "Content-Type": "application/json",
+        api_key: BASE44_API_KEY,
+      },
       body: JSON.stringify(alert),
     });
+
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");
       console.error("Base44 ingest failed:", resp.status, text.slice(0, 400));
@@ -275,9 +308,10 @@ async function pushToBase44(alert) {
 // ===== Telegram =====
 async function pushToTelegram(text, opts = {}) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    const msg = "Telegram not configured (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID)";
+    const msg = "Telegram not configured";
+    console.error(msg);
     if (opts.returnDebug) return { sent: false, reason: msg };
-    return;
+    return false;
   }
 
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -296,15 +330,22 @@ async function pushToTelegram(text, opts = {}) {
     const bodyText = await resp.text().catch(() => "");
 
     if (!resp.ok) {
-      console.error("Telegram send failed:", resp.status, bodyText.slice(0, 400));
-      if (opts.returnDebug) return { sent: false, status: resp.status, body: bodyText.slice(0, 400) };
-      return;
+      console.error("Telegram send failed:", resp.status, bodyText);
+      if (opts.returnDebug) {
+        return { sent: false, status: resp.status, body: bodyText };
+      }
+      return false;
     }
 
-    if (opts.returnDebug) return { sent: true, status: resp.status, body: bodyText.slice(0, 400) };
+    console.log("Telegram sent successfully");
+    if (opts.returnDebug) {
+      return { sent: true, status: resp.status, body: bodyText };
+    }
+    return true;
   } catch (e) {
     console.error("Telegram send error:", e.message);
     if (opts.returnDebug) return { sent: false, error: e.message };
+    return false;
   }
 }
 
@@ -329,18 +370,19 @@ const cache = {
   avgVol: new Map(),
   float: new Map(),
   news: new Map(),
-  minuteAggs: new Map(), // key -> { value, expiresAt }
+  minuteAggs: new Map(),
 };
 
 function getCache(map, key) {
-  const e = map.get(key);
-  if (!e) return null;
-  if (Date.now() > e.expiresAt) {
+  const entry = map.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
     map.delete(key);
     return null;
   }
-  return e.value;
+  return entry.value;
 }
+
 function setCache(map, key, value, ttlMs) {
   map.set(key, { value, expiresAt: Date.now() + ttlMs });
 }
@@ -354,15 +396,9 @@ async function polygonJson(url) {
   return resp.json();
 }
 
-/**
- * ✅ FIXED: full pagination + max page size
- * This is the main reason you were stuck around ~1239 tickers.
- */
 async function fetchAllSnapshotTickers() {
   const all = [];
   let url = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?limit=1000&apiKey=${POLYGON_KEY}`;
-
-  // hard safety stop
   const MAX_PAGES = 200;
 
   for (let page = 0; page < MAX_PAGES && url; page++) {
@@ -382,13 +418,19 @@ async function fetchAllSnapshotTickers() {
 }
 
 function computePercentChangeFromSnapshot(t) {
-  const price = Number(t?.lastTrade?.p || 0);
+  const price =
+    Number(t?.lastTrade?.p) ||
+    Number(t?.day?.c) ||
+    Number(t?.prevDay?.c) ||
+    0;
+
   const prevClose = Number(t?.prevDay?.c || 0);
+
   if (price > 0 && prevClose > 0) {
     return ((price - prevClose) / prevClose) * 100;
   }
-  const pc = Number(t?.todaysChangePerc || 0);
-  return pc;
+
+  return Number(t?.todaysChangePerc || 0);
 }
 
 async function getAvgDailyVolume(ticker) {
@@ -398,6 +440,7 @@ async function getAvgDailyVolume(ticker) {
   const lookbackCalendarDays = Math.max(AVG_VOL_DAYS * 2, 40);
   const to = new Date();
   const from = new Date(Date.now() - lookbackCalendarDays * 24 * 60 * 60 * 1000);
+
   const toStr = to.toISOString().slice(0, 10);
   const fromStr = from.toISOString().slice(0, 10);
 
@@ -427,7 +470,9 @@ async function getFloatOrSharesOutstanding(ticker) {
   const cached = getCache(cache.float, ticker);
   if (cached != null) return cached;
 
-  const url = `https://api.polygon.io/v3/reference/tickers/${encodeURIComponent(ticker)}?apiKey=${POLYGON_KEY}`;
+  const url =
+    `https://api.polygon.io/v3/reference/tickers/${encodeURIComponent(ticker)}?apiKey=${POLYGON_KEY}`;
+
   const data = await polygonJson(url);
   const res = data?.results || {};
 
@@ -447,17 +492,19 @@ async function hasRecentNews(ticker, lookbackMin) {
   if (cached != null) return cached;
 
   const sinceIso = new Date(Date.now() - lookbackMin * 60 * 1000).toISOString();
+
   const url =
     `https://api.polygon.io/v2/reference/news?ticker=${encodeURIComponent(ticker)}` +
     `&published_utc.gte=${encodeURIComponent(sinceIso)}` +
     `&limit=5&apiKey=${POLYGON_KEY}`;
 
   let ok = false;
+
   try {
     const data = await polygonJson(url);
     const results = Array.isArray(data?.results) ? data.results : [];
     ok = results.length > 0;
-  } catch {
+  } catch (e) {
     ok = false;
   }
 
@@ -465,7 +512,6 @@ async function hasRecentNews(ticker, lookbackMin) {
   return ok;
 }
 
-// minute aggs for volume spike + premarket volume
 async function getMinuteAggs(ticker, minutesBack) {
   const cacheKey = `${ticker}:${minutesBack}`;
   const cached = getCache(cache.minuteAggs, cacheKey);
@@ -485,11 +531,15 @@ async function getMinuteAggs(ticker, minutesBack) {
   const results = Array.isArray(data?.results) ? data.results : [];
 
   const cutoff = Date.now() - minutesBack * 60 * 1000;
+
   const filtered = results
     .filter((r) => Number(r?.t || 0) >= cutoff)
-    .map((r) => ({ t: Number(r.t), v: Number(r.v || 0) }));
+    .map((r) => ({
+      t: Number(r.t),
+      v: Number(r.v || 0),
+    }));
 
-  setCache(cache.minuteAggs, cacheKey, filtered, 20 * 1000); // 20s cache
+  setCache(cache.minuteAggs, cacheKey, filtered, 20 * 1000);
   return filtered;
 }
 
@@ -499,23 +549,29 @@ async function computePremarketVolumeAndSpike(ticker) {
     Math.max(VOLUME_BASELINE_MIN, VOLUME_LOOKBACK_MIN) + 2
   );
 
-  const totalVol = bars.reduce((s, b) => s + (b.v || 0), 0);
+  const totalVol = bars.reduce((sum, b) => sum + (b.v || 0), 0);
 
   const sortedAsc = [...bars].sort((a, b) => a.t - b.t);
   const lastN = sortedAsc.slice(-VOLUME_LOOKBACK_MIN);
   const base = sortedAsc.slice(0, Math.max(0, sortedAsc.length - VOLUME_LOOKBACK_MIN));
 
-  const lastAvg = lastN.length ? lastN.reduce((s, b) => s + b.v, 0) / lastN.length : 0;
+  const lastAvg = lastN.length
+    ? lastN.reduce((sum, b) => sum + b.v, 0) / lastN.length
+    : 0;
+
   const baseUse = base.slice(-VOLUME_BASELINE_MIN);
-  const baseAvg = baseUse.length ? baseUse.reduce((s, b) => s + b.v, 0) / baseUse.length : 0;
+  const baseAvg = baseUse.length
+    ? baseUse.reduce((sum, b) => sum + b.v, 0) / baseUse.length
+    : 0;
 
   const spike = baseAvg > 0 ? lastAvg / baseAvg : 0;
 
   return { totalVol, spikeMultiplier: spike };
 }
 
-// ===== cooldown =====
-const cooldownMap = new Map(); // key -> expiresAt
+// ===== Cooldown =====
+const cooldownMap = new Map();
+
 function inCooldown(key) {
   const exp = cooldownMap.get(key);
   if (!exp) return false;
@@ -525,26 +581,29 @@ function inCooldown(key) {
   }
   return true;
 }
+
 function setCooldown(key) {
   cooldownMap.set(key, Date.now() + ALERT_COOLDOWN_MIN * 60 * 1000);
 }
 
-// ===== concurrency =====
+// ===== Concurrency =====
 async function runWithConcurrency(items, limit, workerFn) {
   const results = [];
   let idx = 0;
+
   async function runner() {
     while (idx < items.length) {
-      const i = idx++;
-      results[i] = await workerFn(items[i], i);
+      const currentIndex = idx++;
+      results[currentIndex] = await workerFn(items[currentIndex], currentIndex);
     }
   }
+
   const runners = Array.from({ length: Math.max(1, limit) }, () => runner());
   await Promise.all(runners);
   return results;
 }
 
-// ===== scanner =====
+// ===== Scanner =====
 async function scan() {
   lastLoopAt = new Date().toISOString();
   if (isScanning) return;
@@ -572,18 +631,37 @@ async function scan() {
     let raw = tickers
       .map((t) => {
         const symbol = t?.ticker;
-        const price = Number(t?.lastTrade?.p || 0);
+
+        // ===== FIX #1 =====
+        // Use fallback prices if lastTrade is missing
+        const price =
+          Number(t?.lastTrade?.p) ||
+          Number(t?.day?.c) ||
+          Number(t?.prevDay?.c) ||
+          0;
+
         const pct = computePercentChangeFromSnapshot(t);
         const dayVol = Number(t?.day?.v || 0);
         const prevClose = Number(t?.prevDay?.c || 0);
+
         return { symbol, price, pct, dayVol, prevClose };
       })
-      .filter((x) => x.symbol && x.price >= PRICE_MIN && x.price <= PRICE_MAX);
+      .filter((x) => x.symbol);
+
+    // ===== FIX #2 =====
+    // Only throw out invalid / zero-price symbols here
+    raw = raw.filter((x) => x.price > 0);
+
+    // Now apply price range
+    raw = raw.filter((x) => x.price >= PRICE_MIN && x.price <= PRICE_MAX);
 
     candidatesFound = raw.length;
 
     raw.sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct));
-    if (MAX_CANDIDATES > 0) raw = raw.slice(0, MAX_CANDIDATES);
+
+    if (MAX_CANDIDATES > 0) {
+      raw = raw.slice(0, MAX_CANDIDATES);
+    }
 
     console.log(
       `Tickers fetched: ${tickersFetched} | Snapshot candidates: ${candidatesFound} | Deep-checking: ${raw.length}`
@@ -596,9 +674,10 @@ async function scan() {
         const floatVal = await getFloatOrSharesOutstanding(ticker);
         if (!floatVal || floatVal <= 0 || floatVal > MAX_FLOAT) return;
 
-        // Premarket gappers path
+        // ===== Premarket gapper path =====
         if (PREMARKET_ENABLED && c.pct >= PREMARKET_MIN_GAP) {
           const key = `${ticker}:GAPPER`;
+
           if (inCooldown(key)) return;
           if (await wasAlertedRecently(ticker, "GAPPER")) {
             setCooldown(key);
@@ -608,7 +687,10 @@ async function scan() {
           const { totalVol, spikeMultiplier } = await computePremarketVolumeAndSpike(ticker);
 
           if (totalVol < PREMARKET_MIN_VOL) return;
-          if (spikeMultiplier < VOLUME_SPIKE_MULTIPLIER) return;
+
+          // ===== BETTER =====
+          // Don't require spike unless explicitly enabled
+          if (PREMARKET_REQUIRE_SPIKE && spikeMultiplier < VOLUME_SPIKE_MULTIPLIER) return;
 
           const newsOk = PREMARKET_REQUIRE_NEWS
             ? await hasRecentNews(ticker, NEWS_LOOKBACK_MIN)
@@ -634,6 +716,7 @@ async function scan() {
 
           const inserted = await insertAlert(alertPayload);
           await pushToBase44(inserted);
+          console.log(`Sending Telegram for ${ticker} (GAPPER)`);
           await pushToTelegram(formatTelegram(inserted));
 
           alertsCreated += 1;
@@ -645,12 +728,14 @@ async function scan() {
               totalVol
             )} spike=${spikeMultiplier.toFixed(2)} float=${Math.round(floatVal)}`
           );
+
           return;
         }
 
-        // Runner path
+        // ===== Runner path =====
         if (RUNNER_ENABLED && c.pct >= MIN_PERCENT_CHANGE && c.dayVol >= RUNNER_MIN_VOL) {
           const key = `${ticker}:RUNNER`;
+
           if (inCooldown(key)) return;
           if (await wasAlertedRecently(ticker, "RUNNER")) {
             setCooldown(key);
@@ -663,8 +748,10 @@ async function scan() {
           const rvol = c.dayVol / avgVol;
           if (rvol < MIN_RVOL) return;
 
+          // ===== 10x better line =====
+          // Don't require news by default for runners
           const newsOk = await hasRecentNews(ticker, NEWS_LOOKBACK_MIN);
-          if (!newsOk) return;
+          if (RUNNER_REQUIRE_NEWS && !newsOk) return;
 
           deepChecked += 1;
 
@@ -674,13 +761,14 @@ async function scan() {
             percent_change: Number(c.pct.toFixed(2)),
             rvol: Number(rvol.toFixed(2)),
             float: Math.round(floatVal),
-            news: true,
+            news: Boolean(newsOk),
             alert_type: "RUNNER",
             meta: null,
           };
 
           const inserted = await insertAlert(alertPayload);
           await pushToBase44(inserted);
+          console.log(`Sending Telegram for ${ticker} (RUNNER)`);
           await pushToTelegram(formatTelegram(inserted));
 
           alertsCreated += 1;
@@ -708,8 +796,9 @@ async function scan() {
   }
 }
 
-// ===== start =====
+// ===== Start =====
 const PORT = process.env.PORT || 8080;
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port", PORT);
   console.log("Telegram enabled:", Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID));
