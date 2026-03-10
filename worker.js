@@ -20,13 +20,13 @@ if (typeof fetch !== "function") {
  * - TELEGRAM_BOT_TOKEN
  * - TELEGRAM_CHAT_ID
  *
- * Scan tuning:
+ * Recommended tighter defaults:
  * - SCAN_INTERVAL_MS=15000
- * - PRICE_MIN=0.5
- * - PRICE_MAX=40
- * - MAX_FLOAT=5000000
+ * - PRICE_MIN=1
+ * - PRICE_MAX=20
+ * - MAX_FLOAT=3000000
  * - AVG_VOL_DAYS=30
- * - ALERT_COOLDOWN_MIN=30
+ * - ALERT_COOLDOWN_MIN=60
  * - MAX_CANDIDATES=400
  * - CONCURRENCY=4
  * - NEWS_LOOKBACK_MIN=1440
@@ -34,14 +34,14 @@ if (typeof fetch !== "function") {
  * Runner:
  * - RUNNER_ENABLED=true
  * - RUNNER_REQUIRE_NEWS=false
- * - MIN_PERCENT_CHANGE=5
- * - MIN_RVOL=3
- * - RUNNER_MIN_VOL=100000
+ * - MIN_PERCENT_CHANGE=8
+ * - MIN_RVOL=5
+ * - RUNNER_MIN_VOL=300000
  *
  * Premarket gappers:
  * - PREMARKET_ENABLED=true
- * - PREMARKET_MIN_GAP=5
- * - PREMARKET_MIN_VOL=10000
+ * - PREMARKET_MIN_GAP=8
+ * - PREMARKET_MIN_VOL=50000
  * - PREMARKET_REQUIRE_NEWS=false
  * - PREMARKET_REQUIRE_SPIKE=false
  *
@@ -49,6 +49,10 @@ if (typeof fetch !== "function") {
  * - VOLUME_SPIKE_MULTIPLIER=2
  * - VOLUME_LOOKBACK_MIN=5
  * - VOLUME_BASELINE_MIN=30
+ *
+ * Scan window (Pacific Time):
+ * - SCAN_START_HOUR_PT=4
+ * - SCAN_END_HOUR_PT=12
  */
 
 const POLYGON_KEY = process.env.POLYGON_KEY;
@@ -66,29 +70,33 @@ if (!DATABASE_URL) console.error("Missing env var: DATABASE_URL");
 // ===== Criteria =====
 const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 15000);
 
-const PRICE_MIN = Number(process.env.PRICE_MIN || 0.5);
-const PRICE_MAX = Number(process.env.PRICE_MAX || 40);
-const MAX_FLOAT = Number(process.env.MAX_FLOAT || 5000000);
+const PRICE_MIN = Number(process.env.PRICE_MIN || 1);
+const PRICE_MAX = Number(process.env.PRICE_MAX || 20);
+const MAX_FLOAT = Number(process.env.MAX_FLOAT || 3000000);
 
 const AVG_VOL_DAYS = Number(process.env.AVG_VOL_DAYS || 30);
-const ALERT_COOLDOWN_MIN = Number(process.env.ALERT_COOLDOWN_MIN || 30);
+const ALERT_COOLDOWN_MIN = Number(process.env.ALERT_COOLDOWN_MIN || 60);
 
 const MAX_CANDIDATES = Number(process.env.MAX_CANDIDATES || 400);
 const CONCURRENCY = Number(process.env.CONCURRENCY || 4);
 
 const NEWS_LOOKBACK_MIN = Number(process.env.NEWS_LOOKBACK_MIN || 1440);
 
+// Scan window (Pacific Time)
+const SCAN_START_HOUR_PT = Number(process.env.SCAN_START_HOUR_PT || 4);
+const SCAN_END_HOUR_PT = Number(process.env.SCAN_END_HOUR_PT || 12);
+
 // Runner
 const RUNNER_ENABLED = String(process.env.RUNNER_ENABLED || "true") === "true";
 const RUNNER_REQUIRE_NEWS = String(process.env.RUNNER_REQUIRE_NEWS || "false") === "true";
-const MIN_PERCENT_CHANGE = Number(process.env.MIN_PERCENT_CHANGE || 5);
-const MIN_RVOL = Number(process.env.MIN_RVOL || 3);
-const RUNNER_MIN_VOL = Number(process.env.RUNNER_MIN_VOL || 100000);
+const MIN_PERCENT_CHANGE = Number(process.env.MIN_PERCENT_CHANGE || 8);
+const MIN_RVOL = Number(process.env.MIN_RVOL || 5);
+const RUNNER_MIN_VOL = Number(process.env.RUNNER_MIN_VOL || 300000);
 
 // Premarket gappers
 const PREMARKET_ENABLED = String(process.env.PREMARKET_ENABLED || "true") === "true";
-const PREMARKET_MIN_GAP = Number(process.env.PREMARKET_MIN_GAP || 5);
-const PREMARKET_MIN_VOL = Number(process.env.PREMARKET_MIN_VOL || 10000);
+const PREMARKET_MIN_GAP = Number(process.env.PREMARKET_MIN_GAP || 8);
+const PREMARKET_MIN_VOL = Number(process.env.PREMARKET_MIN_VOL || 50000);
 const PREMARKET_REQUIRE_NEWS = String(process.env.PREMARKET_REQUIRE_NEWS || "false") === "true";
 const PREMARKET_REQUIRE_SPIKE = String(process.env.PREMARKET_REQUIRE_SPIKE || "false") === "true";
 
@@ -159,6 +167,8 @@ app.get("/health", async (req, res) => {
         MAX_CANDIDATES,
         CONCURRENCY,
         NEWS_LOOKBACK_MIN,
+        SCAN_START_HOUR_PT,
+        SCAN_END_HOUR_PT,
 
         RUNNER_ENABLED,
         RUNNER_REQUIRE_NEWS,
@@ -605,6 +615,21 @@ async function runWithConcurrency(items, limit, workerFn) {
 
 // ===== Scanner =====
 async function scan() {
+  // ===== Trading session window (Pacific Time) =====
+  const now = new Date();
+  const pacific = new Date(
+    now.toLocaleString("en-US", { timeZone: "America/Los_Angeles" })
+  );
+
+  const hour = pacific.getHours();
+
+  if (hour < SCAN_START_HOUR_PT || hour >= SCAN_END_HOUR_PT) {
+    console.log(
+      `Outside trading scan window (${SCAN_START_HOUR_PT}:00–${SCAN_END_HOUR_PT}:00 PT). Skipping scan.`
+    );
+    return;
+  }
+
   lastLoopAt = new Date().toISOString();
   if (isScanning) return;
 
@@ -632,8 +657,6 @@ async function scan() {
       .map((t) => {
         const symbol = t?.ticker;
 
-        // ===== FIX #1 =====
-        // Use fallback prices if lastTrade is missing
         const price =
           Number(t?.lastTrade?.p) ||
           Number(t?.day?.c) ||
@@ -648,11 +671,7 @@ async function scan() {
       })
       .filter((x) => x.symbol);
 
-    // ===== FIX #2 =====
-    // Only throw out invalid / zero-price symbols here
     raw = raw.filter((x) => x.price > 0);
-
-    // Now apply price range
     raw = raw.filter((x) => x.price >= PRICE_MIN && x.price <= PRICE_MAX);
 
     candidatesFound = raw.length;
@@ -688,8 +707,6 @@ async function scan() {
 
           if (totalVol < PREMARKET_MIN_VOL) return;
 
-          // ===== BETTER =====
-          // Don't require spike unless explicitly enabled
           if (PREMARKET_REQUIRE_SPIKE && spikeMultiplier < VOLUME_SPIKE_MULTIPLIER) return;
 
           const newsOk = PREMARKET_REQUIRE_NEWS
@@ -748,8 +765,6 @@ async function scan() {
           const rvol = c.dayVol / avgVol;
           if (rvol < MIN_RVOL) return;
 
-          // ===== 10x better line =====
-          // Don't require news by default for runners
           const newsOk = await hasRecentNews(ticker, NEWS_LOOKBACK_MIN);
           if (RUNNER_REQUIRE_NEWS && !newsOk) return;
 
