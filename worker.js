@@ -18,41 +18,43 @@ if (!POLYGON_KEY)  console.error("Missing env var: POLYGON_KEY");
 if (!DATABASE_URL) console.error("Missing env var: DATABASE_URL");
 
 // ===== CONFIG =====
-const SCAN_INTERVAL_MS       = Number(process.env.SCAN_INTERVAL_MS       || 15000);
-const PRICE_MIN               = Number(process.env.PRICE_MIN               || 1);
-const PRICE_MAX               = Number(process.env.PRICE_MAX               || 12);
-const MAX_FLOAT               = Number(process.env.MAX_FLOAT               || 5_000_000);
-const AVG_VOL_DAYS            = Number(process.env.AVG_VOL_DAYS            || 30);
-const ALERT_COOLDOWN_MIN      = Number(process.env.ALERT_COOLDOWN_MIN      || 90);
-const MAX_CANDIDATES          = Number(process.env.MAX_CANDIDATES          || 500);
-const CONCURRENCY             = Number(process.env.CONCURRENCY             || 4);
-const NEWS_LOOKBACK_MIN       = Number(process.env.NEWS_LOOKBACK_MIN       || 1440);
-const SCAN_START_HOUR_PT      = Number(process.env.SCAN_START_HOUR_PT      || 4);
-const SCAN_END_HOUR_PT        = Number(process.env.SCAN_END_HOUR_PT        || 12);
-const MIN_MOMENTUM_SCORE      = Number(process.env.MIN_MOMENTUM_SCORE      || 75);
-const TOP_ALERTS_PER_SCAN     = Number(process.env.TOP_ALERTS_PER_SCAN     || 2);
-const LOW_FLOAT_THRESHOLD     = Number(process.env.LOW_FLOAT_THRESHOLD     || 2_000_000);
-const MID_FLOAT_THRESHOLD     = Number(process.env.MID_FLOAT_THRESHOLD     || 5_000_000);
-const EARLY_ALERTS_ENABLED    = process.env.EARLY_ALERTS_ENABLED  !== "false";
-const EARLY_MIN_PERCENT_CHANGE= Number(process.env.EARLY_MIN_PERCENT_CHANGE|| 3);
-const EARLY_MIN_RVOL          = Number(process.env.EARLY_MIN_RVOL          || 50);
-const EARLY_MIN_ACCEL         = Number(process.env.EARLY_MIN_ACCEL         || 2);
-const RUNNER_ENABLED          = process.env.RUNNER_ENABLED         !== "false";
-const RUNNER_REQUIRE_NEWS     = process.env.RUNNER_REQUIRE_NEWS    === "true";
-const MIN_PERCENT_CHANGE      = Number(process.env.MIN_PERCENT_CHANGE      || 5);
-const RUNNER_MAX_PERCENT_CHANGE = Number(process.env.RUNNER_MAX_PERCENT_CHANGE || 80);
-const MIN_RVOL                = Number(process.env.MIN_RVOL                || 5);
-const RUNNER_MIN_VOL          = Number(process.env.RUNNER_MIN_VOL          || 300_000);
-const PREMARKET_ENABLED       = process.env.PREMARKET_ENABLED      !== "false";
-const PREMARKET_MIN_GAP       = Number(process.env.PREMARKET_MIN_GAP       || 8);
-const PREMARKET_MIN_VOL       = Number(process.env.PREMARKET_MIN_VOL       || 50_000);
-const PREMARKET_REQUIRE_NEWS  = process.env.PREMARKET_REQUIRE_NEWS === "true";
-const PREMARKET_REQUIRE_SPIKE = process.env.PREMARKET_REQUIRE_SPIKE=== "true";
-const VOLUME_SPIKE_MULTIPLIER = Number(process.env.VOLUME_SPIKE_MULTIPLIER || 2);
-const VOLUME_LOOKBACK_MIN     = Number(process.env.VOLUME_LOOKBACK_MIN     || 5);
-const VOLUME_BASELINE_MIN     = Number(process.env.VOLUME_BASELINE_MIN     || 30);
-const POLYGON_RETRY_ATTEMPTS  = Number(process.env.POLYGON_RETRY_ATTEMPTS  || 3);
-const POLYGON_RETRY_DELAY_MS  = Number(process.env.POLYGON_RETRY_DELAY_MS  || 500);
+const SCAN_INTERVAL_MS        = Number(process.env.SCAN_INTERVAL_MS        || 15000);
+const PRICE_MIN                = Number(process.env.PRICE_MIN                || 1);
+const PRICE_MAX                = Number(process.env.PRICE_MAX                || 12);
+const MAX_FLOAT                = Number(process.env.MAX_FLOAT                || 5_000_000);
+const AVG_VOL_DAYS             = Number(process.env.AVG_VOL_DAYS             || 30);
+const ALERT_COOLDOWN_MIN       = Number(process.env.ALERT_COOLDOWN_MIN       || 90);
+const MAX_CANDIDATES           = Number(process.env.MAX_CANDIDATES           || 500);
+const CONCURRENCY              = Number(process.env.CONCURRENCY              || 4);
+const NEWS_LOOKBACK_MIN        = Number(process.env.NEWS_LOOKBACK_MIN        || 1440);
+const SCAN_START_HOUR_PT       = Number(process.env.SCAN_START_HOUR_PT       || 4);
+const SCAN_END_HOUR_PT         = Number(process.env.SCAN_END_HOUR_PT         || 12);
+const MIN_MOMENTUM_SCORE       = Number(process.env.MIN_MOMENTUM_SCORE       || 78);
+const TOP_ALERTS_PER_SCAN      = Number(process.env.TOP_ALERTS_PER_SCAN      || 2);
+const LOW_FLOAT_THRESHOLD      = Number(process.env.LOW_FLOAT_THRESHOLD      || 2_000_000);
+const MID_FLOAT_THRESHOLD      = Number(process.env.MID_FLOAT_THRESHOLD      || 5_000_000);
+const EARLY_ALERTS_ENABLED     = process.env.EARLY_ALERTS_ENABLED   !== "false";
+const EARLY_MIN_PERCENT_CHANGE = Number(process.env.EARLY_MIN_PERCENT_CHANGE || 3);
+const EARLY_MIN_RVOL           = Number(process.env.EARLY_MIN_RVOL           || 50);
+const EARLY_MIN_ACCEL          = Number(process.env.EARLY_MIN_ACCEL          || 2);
+const RUNNER_ENABLED           = process.env.RUNNER_ENABLED          !== "false";
+const RUNNER_REQUIRE_NEWS      = process.env.RUNNER_REQUIRE_NEWS     === "true";
+const MIN_PERCENT_CHANGE       = Number(process.env.MIN_PERCENT_CHANGE       || 5);
+const RUNNER_MAX_PERCENT_CHANGE= Number(process.env.RUNNER_MAX_PERCENT_CHANGE|| 80);
+const MIN_RVOL                 = Number(process.env.MIN_RVOL                 || 15);
+const RUNNER_MIN_VOL           = Number(process.env.RUNNER_MIN_VOL           || 500_000);
+const MIN_VOLUME_TREND         = Number(process.env.MIN_VOLUME_TREND         || 1.0);
+const PREMARKET_ENABLED        = process.env.PREMARKET_ENABLED       !== "false";
+const PREMARKET_MIN_GAP        = Number(process.env.PREMARKET_MIN_GAP        || 8);
+const PREMARKET_MIN_VOL        = Number(process.env.PREMARKET_MIN_VOL        || 150_000);
+const GAPPER_MIN_RVOL          = Number(process.env.GAPPER_MIN_RVOL          || 10);
+const PREMARKET_REQUIRE_NEWS   = process.env.PREMARKET_REQUIRE_NEWS  === "true";
+const PREMARKET_REQUIRE_SPIKE  = process.env.PREMARKET_REQUIRE_SPIKE === "true";
+const VOLUME_SPIKE_MULTIPLIER  = Number(process.env.VOLUME_SPIKE_MULTIPLIER  || 2);
+const VOLUME_LOOKBACK_MIN      = Number(process.env.VOLUME_LOOKBACK_MIN      || 5);
+const VOLUME_BASELINE_MIN      = Number(process.env.VOLUME_BASELINE_MIN      || 30);
+const POLYGON_RETRY_ATTEMPTS   = Number(process.env.POLYGON_RETRY_ATTEMPTS   || 3);
+const POLYGON_RETRY_DELAY_MS   = Number(process.env.POLYGON_RETRY_DELAY_MS   || 500);
 
 // ===== DB =====
 const pool = new Pool({
@@ -108,8 +110,8 @@ app.get("/health", async (_req, res) => {
         TOP_ALERTS_PER_SCAN, LOW_FLOAT_THRESHOLD, MID_FLOAT_THRESHOLD,
         EARLY_ALERTS_ENABLED, EARLY_MIN_PERCENT_CHANGE, EARLY_MIN_RVOL, EARLY_MIN_ACCEL,
         RUNNER_ENABLED, RUNNER_REQUIRE_NEWS, MIN_PERCENT_CHANGE,
-        RUNNER_MAX_PERCENT_CHANGE, MIN_RVOL, RUNNER_MIN_VOL,
-        PREMARKET_ENABLED, PREMARKET_MIN_GAP, PREMARKET_MIN_VOL,
+        RUNNER_MAX_PERCENT_CHANGE, MIN_RVOL, RUNNER_MIN_VOL, MIN_VOLUME_TREND,
+        PREMARKET_ENABLED, PREMARKET_MIN_GAP, PREMARKET_MIN_VOL, GAPPER_MIN_RVOL,
         PREMARKET_REQUIRE_NEWS, PREMARKET_REQUIRE_SPIKE,
         VOLUME_SPIKE_MULTIPLIER, VOLUME_LOOKBACK_MIN, VOLUME_BASELINE_MIN,
       },
@@ -246,9 +248,11 @@ function formatTelegram(a) {
   const type  = a.alert_type || "ALERT";
 
   let scoreText = "";
+  let trendText = "";
   try {
     const meta = a.meta ? JSON.parse(a.meta) : null;
-    if (meta?.score != null) scoreText = `Score: <b>${Math.round(meta.score)}</b>\n`;
+    if (meta?.score    != null) scoreText = `Score: <b>${Math.round(meta.score)}</b>\n`;
+    if (meta?.volumeTrend != null) trendText = `Trend: ${Number(meta.volumeTrend).toFixed(2)}\n`;
   } catch {}
 
   return (
@@ -256,7 +260,7 @@ function formatTelegram(a) {
     `<b>${a.ticker}</b>  $${price}  (<b>${pct}%</b>)\n` +
     `RVOL: ${rvol}   Float: ${fl}\n` +
     `News: ${news}\n` +
-    `${scoreText}<a href="${tv}">Chart →</a>`
+    `${trendText}${scoreText}<a href="${tv}">Chart →</a>`
   );
 }
 
@@ -459,10 +463,10 @@ async function computePremarketVolumeAndSpike(ticker) {
   const lastN     = sortedAsc.slice(-VOLUME_LOOKBACK_MIN);
   const base      = sortedAsc.slice(0, Math.max(0, sortedAsc.length - VOLUME_LOOKBACK_MIN));
 
-  const lastAvg  = lastN.length
+  const lastAvg   = lastN.length
     ? lastN.reduce((s, b) => s + b.v, 0) / lastN.length : 0;
   const baseSlice = base.slice(-VOLUME_BASELINE_MIN);
-  const baseAvg  = baseSlice.length
+  const baseAvg   = baseSlice.length
     ? baseSlice.reduce((s, b) => s + b.v, 0) / baseSlice.length : 0;
 
   const spike  = baseAvg > 0 ? lastAvg / baseAvg : 0;
@@ -581,13 +585,13 @@ async function scan() {
   lastError = null;
   lastScanStartedAt = new Date().toISOString();
 
-  let tickersFetched    = 0;
-  let candidatesFound   = 0;
-  let runnerCandidates  = 0;
-  let gapperCandidates  = 0;
-  let earlyCandidates   = 0;
-  let deepChecked       = 0;
-  let alertsCreated     = 0;
+  let tickersFetched   = 0;
+  let candidatesFound  = 0;
+  let runnerCandidates = 0;
+  let gapperCandidates = 0;
+  let earlyCandidates  = 0;
+  let deepChecked      = 0;
+  let alertsCreated    = 0;
 
   try {
     console.log(`[Scan #${scanRuns}] Starting...`);
@@ -639,8 +643,8 @@ async function scan() {
           const pm    = await computePremarketVolumeAndSpike(ticker);
           volumeAccel     = Number(pm.spikeMultiplier || 0);
           spikeMultiplier = volumeAccel;
-          pmHigh          = Number(pm.pmHigh    || 0);
-          totalVol        = Number(pm.totalVol  || 0);
+          pmHigh          = Number(pm.pmHigh     || 0);
+          totalVol        = Number(pm.totalVol   || 0);
           volumeTrend     = Number(pm.volumeTrend || 1);
           breakout        = pmHigh > 0 && c.price >= pmHigh;
         } catch { /* non-fatal */ }
@@ -653,7 +657,7 @@ async function scan() {
 
         // ── EARLY ALERT ──────────────────────────────────────────────
         if (
-          EARLY_ALERTS_ENABLED          &&
+          EARLY_ALERTS_ENABLED             &&
           c.pct       >= EARLY_MIN_PERCENT_CHANGE &&
           rvol        >= EARLY_MIN_RVOL           &&
           volumeAccel >= EARLY_MIN_ACCEL
@@ -675,14 +679,15 @@ async function scan() {
 
         // ── RUNNER ───────────────────────────────────────────────────
         if (
-          RUNNER_ENABLED                        &&
-          c.pct    >= MIN_PERCENT_CHANGE        &&
-          c.pct    <= RUNNER_MAX_PERCENT_CHANGE &&
-          c.dayVol >= RUNNER_MIN_VOL            &&
+          RUNNER_ENABLED                         &&
+          c.pct    >= MIN_PERCENT_CHANGE         &&
+          c.pct    <= RUNNER_MAX_PERCENT_CHANGE  &&
+          c.dayVol >= RUNNER_MIN_VOL             &&
           rvol     >= MIN_RVOL
         ) {
-          if (RUNNER_REQUIRE_NEWS && !newsOk) return;
-          if (baseScore < MIN_MOMENTUM_SCORE)  return;
+          if (RUNNER_REQUIRE_NEWS && !newsOk)   return;
+          if (volumeTrend < MIN_VOLUME_TREND)   return;
+          if (baseScore   < MIN_MOMENTUM_SCORE) return;
 
           runnerCandidates++;
 
@@ -705,13 +710,13 @@ async function scan() {
             alert_type:     type,
             score:          baseScore,
             meta: JSON.stringify({
-              score:            Number(baseScore.toFixed(2)),
-              volumeAccel:      Number(volumeAccel.toFixed(2)),
-              volumeTrend:      Number(volumeTrend.toFixed(2)),
+              score:             Number(baseScore.toFixed(2)),
+              volumeAccel:       Number(volumeAccel.toFixed(2)),
+              volumeTrend:       Number(volumeTrend.toFixed(2)),
               breakout,
-              pmHigh:           Number(pmHigh.toFixed(2)),
-              trueFloat:        Math.round(trueFloat),
-              sharesOutstanding:Math.round(sharesOut),
+              pmHigh:            Number(pmHigh.toFixed(2)),
+              trueFloat:         Math.round(trueFloat),
+              sharesOutstanding: Math.round(sharesOut),
             }),
             cooldownKey: key,
           });
@@ -721,9 +726,12 @@ async function scan() {
         // ── GAPPER ───────────────────────────────────────────────────
         if (PREMARKET_ENABLED && c.pct >= PREMARKET_MIN_GAP) {
           const gapBreakout = pmHigh > 0 && c.price >= pmHigh;
-          if (totalVol < PREMARKET_MIN_VOL) return;
-          if (PREMARKET_REQUIRE_SPIKE && spikeMultiplier < VOLUME_SPIKE_MULTIPLIER) return;
-          if (PREMARKET_REQUIRE_NEWS  && !newsOk) return;
+
+          if (totalVol        < PREMARKET_MIN_VOL)        return;
+          if (rvol            < GAPPER_MIN_RVOL)          return;
+          if (volumeTrend     < MIN_VOLUME_TREND)         return;
+          if (PREMARKET_REQUIRE_SPIKE && spikeMultiplier  < VOLUME_SPIKE_MULTIPLIER) return;
+          if (PREMARKET_REQUIRE_NEWS  && !newsOk)         return;
 
           const score = computeMomentumScore({
             pct: c.pct, rvol, volumeAccel: spikeMultiplier, volumeTrend,
@@ -746,14 +754,14 @@ async function scan() {
             alert_type:     "GAPPER",
             score,
             meta: JSON.stringify({
-              score:               Number(score.toFixed(2)),
-              premarket_vol_window:Math.round(totalVol),
-              volume_spike:        Number(spikeMultiplier.toFixed(2)),
-              volumeTrend:         Number(volumeTrend.toFixed(2)),
-              breakout:            gapBreakout,
-              pmHigh:              Number(pmHigh || 0),
-              trueFloat:           Math.round(trueFloat),
-              sharesOutstanding:   Math.round(sharesOut),
+              score:                Number(score.toFixed(2)),
+              premarket_vol_window: Math.round(totalVol),
+              volume_spike:         Number(spikeMultiplier.toFixed(2)),
+              volumeTrend:          Number(volumeTrend.toFixed(2)),
+              breakout:             gapBreakout,
+              pmHigh:               Number(pmHigh || 0),
+              trueFloat:            Math.round(trueFloat),
+              sharesOutstanding:    Math.round(sharesOut),
             }),
             cooldownKey: key,
           });
