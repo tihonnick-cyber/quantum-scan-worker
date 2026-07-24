@@ -20,6 +20,11 @@ if (!POLYGON_KEY)     console.error("Missing env var: POLYGON_KEY");
 if (!MASSIVE_API_KEY) console.error("Missing env var: MASSIVE_API_KEY (or POLYGON_KEY fallback)");
 if (!DATABASE_URL)    console.error("Missing env var: DATABASE_URL");
 
+// ===== EXISTING QUANTUM SCANNER MASTER SWITCH =====
+// Set QUANTUM_ENABLED=false in Railway to pause ONLY the old Quantum scanner.
+// The separate Top-20 Scalp scanner is controlled by TOP20_ENABLED.
+const QUANTUM_ENABLED = process.env.QUANTUM_ENABLED !== "false";
+
 // ===== EXISTING SCANNER CONFIG =====
 const SCAN_INTERVAL_MS         = Number(process.env.SCAN_INTERVAL_MS         || 10000);
 const PRICE_MIN                = Number(process.env.PRICE_MIN                || 1);
@@ -134,7 +139,9 @@ app.get("/health", async (_req, res) => {
       telegramEnabled: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
       base44Enabled: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
       massiveEnabled: Boolean(MASSIVE_API_KEY),
+      quantumEnabled: QUANTUM_ENABLED,
       config: {
+        QUANTUM_ENABLED,
         PRICE_MIN, PRICE_MAX, MAX_FLOAT, AVG_VOL_DAYS,
         ALERT_COOLDOWN_MIN, MAX_CANDIDATES, CONCURRENCY, NEWS_LOOKBACK_MIN,
         SCAN_START_HOUR_PT, SCAN_END_HOUR_PT, MIN_MOMENTUM_SCORE,
@@ -146,7 +153,8 @@ app.get("/health", async (_req, res) => {
         PREMARKET_REQUIRE_NEWS, PREMARKET_REQUIRE_SPIKE,
         VOLUME_SPIKE_MULTIPLIER, VOLUME_LOOKBACK_MIN, VOLUME_BASELINE_MIN,
       },
-      top20Technical: {
+      top20Scalp: {
+        name: "TOP 20 SCALP",
         enabled: TOP20_ENABLED,
         isScanning: top20IsScanning,
         scanIntervalMs: TOP20_SCAN_INTERVAL_MS,
@@ -365,8 +373,8 @@ function formatTop20Telegram(result) {
 
   const tv = `https://www.tradingview.com/symbols/${encodeURIComponent(ticker)}/`;
   const title = score >= 5
-    ? `🔥 <b>TOP 20 TECHNICAL — 5/5</b>`
-    : `🟠 <b>TOP 20 TECHNICAL — 4/5</b>`;
+    ? `🔥 <b>TOP 20 SCALP — 5/5</b>`
+    : `🟠 <b>TOP 20 SCALP — 4/5</b>`;
 
   const bonusLine = bonus?.freshSmaCross
     ? `⚡ <b>BONUS:</b> Fresh 10/100 SMA crossover ${crossBarsAgo === 0 ? "now" : `${crossBarsAgo}m ago`}\n`
@@ -1176,6 +1184,11 @@ async function scanTop20Technicals() {
 async function scan() {
   lastLoopAt = new Date().toISOString();
 
+  // Master switch for the existing Quantum scanner only.
+  if (!QUANTUM_ENABLED) {
+    return;
+  }
+
   const hour = pacificHourNow();
 
   if (hour < SCAN_START_HOUR_PT || hour >= SCAN_END_HOUR_PT) {
@@ -1288,6 +1301,10 @@ async function scan() {
             );
             setCooldown(key);
             console.log(`[EARLY] ${ticker} pct=${c.pct.toFixed(2)} rvol=${rvol.toFixed(2)} accel=${volumeAccel.toFixed(2)} trend=${volumeTrend.toFixed(2)} score=${Math.round(baseScore)}`);
+
+            // Do not also send RUNNER/GAPPER for this same ticker in the same pass.
+            // The cross-type cooldown will keep the old Quantum scanner from duplicating it afterward.
+            return;
           }
         }
 
@@ -1425,7 +1442,8 @@ app.listen(PORT, "0.0.0.0", () => {
     `Server on port ${PORT} | ` +
     `Telegram: ${Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID)} | ` +
     `Base44: ${Boolean(BASE44_INGEST_URL && BASE44_API_KEY)} | ` +
-    `TOP20: ${TOP20_ENABLED}`
+    `Quantum: ${QUANTUM_ENABLED} | ` +
+    `Top20Scalp: ${TOP20_ENABLED}`
   );
 });
 
@@ -1433,6 +1451,6 @@ app.listen(PORT, "0.0.0.0", () => {
 scan();
 setInterval(scan, SCAN_INTERVAL_MS);
 
-// New Top-20 Technical scanner
+// New Top-20 Scalp scanner
 scanTop20Technicals();
 setInterval(scanTop20Technicals, TOP20_SCAN_INTERVAL_MS);
