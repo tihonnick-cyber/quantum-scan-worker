@@ -65,7 +65,8 @@ const POLYGON_RETRY_ATTEMPTS   = Number(process.env.POLYGON_RETRY_ATTEMPTS   || 
 const POLYGON_RETRY_DELAY_MS   = Number(process.env.POLYGON_RETRY_DELAY_MS   || 200);
 
 // ===== NEW TOP-20 TECHNICAL SCANNER CONFIG =====
-// This scanner is Telegram-only. It does NOT write to Base44 or the alerts DB.
+// This scanner sends Telegram alerts and also exposes its latest calculated state at GET /top20 for the Base44 visual dashboard.
+// It still does NOT write Top-20 rows into the existing alerts DB.
 const TOP20_ENABLED            = process.env.TOP20_ENABLED !== "false";
 const TOP20_SCAN_INTERVAL_MS   = Number(process.env.TOP20_SCAN_INTERVAL_MS   || 10000);
 const TOP20_START_HOUR_PT      = Number(process.env.TOP20_START_HOUR_PT      || 6);
@@ -94,6 +95,16 @@ const pool = new Pool({
 const app = express();
 app.use(express.json());
 
+// Allow the Base44 web app to read Railway dashboard endpoints directly.
+// Only simple GET/OPTIONS access is exposed here; scanner calculations stay on Railway.
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 // ===== RUNTIME STATE =====
 let isScanning         = false;
 let lastError          = null;
@@ -114,6 +125,7 @@ let top20LastDurationMs     = null;
 let top20ScanRuns           = 0;
 let top20AlertsSent         = 0;
 let top20LastLeaders        = [];
+let top20LastResults        = [];
 let top20LastStats          = {};
 
 // ===== ROUTES =====
@@ -165,6 +177,7 @@ app.get("/health", async (_req, res) => {
         scanRuns: top20ScanRuns,
         alertsSent: top20AlertsSent,
         lastLeaders: top20LastLeaders,
+        latestResultCount: top20LastResults.length,
         lastStats: top20LastStats,
         config: {
           TOP20_START_HOUR_PT,
@@ -185,6 +198,44 @@ app.get("/health", async (_req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, db: "error", error: e.message });
   }
+});
+
+function getTop20ScannerStatus() {
+  if (!TOP20_ENABLED) return "OFF";
+
+  const hour = pacificHourNow();
+  if (hour < TOP20_START_HOUR_PT || hour >= TOP20_END_HOUR_PT) {
+    return "OUTSIDE_HOURS";
+  }
+
+  if (top20LastError && top20LastResults.length === 0) return "ERROR";
+  if (top20IsScanning) return "SCANNING";
+  return "ACTIVE";
+}
+
+// Latest Top-20 Scalp state for the Base44 visual dashboard.
+// This route only returns data already calculated by Railway; it does NOT trigger a new Massive scan.
+app.get("/top20", (_req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  res.json({
+    ok: !top20LastError || top20LastResults.length > 0,
+    scanner: "TOP 20 SCALP",
+    status: getTop20ScannerStatus(),
+    enabled: TOP20_ENABLED,
+    isScanning: top20IsScanning,
+    updatedAt: top20LastFinishedAt,
+    lastStartedAt: top20LastStartedAt,
+    lastError: top20LastError,
+    scanIntervalMs: TOP20_SCAN_INTERVAL_MS,
+    activeWindowPT: {
+      startHour: TOP20_START_HOUR_PT,
+      endHour: TOP20_END_HOUR_PT,
+    },
+    count: top20LastResults.length,
+    stocks: top20LastResults,
+  });
 });
 
 app.get("/alerts", async (_req, res) => {
@@ -1020,6 +1071,41 @@ function evaluateTop20Technical(leader, bars) {
   };
 }
 
+function serializeTop20Result(result) {
+  const c = result.criteria || {};
+  const b = result.bonus || {};
+
+  return {
+    rank: Number(result.rank || 0),
+    ticker: String(result.ticker || ""),
+    price: Number(Number(result.price || 0).toFixed(4)),
+    percentChange: Number(Number(result.pct || 0).toFixed(2)),
+    volume: Math.round(Number(result.volume || 0)),
+    score: Number(result.score || 0),
+
+    // The five core criteria shown in Base44.
+    macdPositive: Boolean(c.macdPositive),
+    sma10Above100: Boolean(c.sma10Above100),
+    volumePass: Boolean(c.volume),
+    threeGreen: Boolean(c.threeGreen),
+    sma100Rising: Boolean(c.sma100Up),
+
+    // Fresh crossover is a BONUS, not part of the 5-point score.
+    freshCross: Boolean(b.freshSmaCross),
+    crossMinutesAgo: result.crossBarsAgo != null ? Number(result.crossBarsAgo) : null,
+
+    // Extra values for detail cards / troubleshooting.
+    sma10: Number(Number(result.sma10 || 0).toFixed(4)),
+    sma100: Number(Number(result.sma100 || 0).toFixed(4)),
+    sma100SlopePct: Number(Number(result.sma100SlopePct || 0).toFixed(4)),
+    macdLine: Number(Number(result.macdLine || 0).toFixed(6)),
+    macdSignal: Number(Number(result.macdSignal || 0).toFixed(6)),
+    macdHistogram: Number(Number(result.macdHistogram || 0).toFixed(6)),
+    barsAvailable: Number(result.barsAvailable || 0),
+    insufficientBars: Boolean(result.insufficientBars),
+  };
+}
+
 // Separate state so TOP20 alerts do not interfere with your existing scanner cooldowns.
 const top20AlertState = new Map();
 
@@ -1136,6 +1222,13 @@ async function scanTop20Technicals() {
         }
       }
     );
+
+    // Publish the complete current Top-20 state for Base44, including 0/5–5/5 names.
+    // Sort by technical score first, then original gainer rank, matching the app design.
+    top20LastResults = evaluated
+      .filter(Boolean)
+      .map(serializeTop20Result)
+      .sort((a, b) => (b.score - a.score) || (a.rank - b.rank));
 
     for (const result of evaluated.filter(Boolean)) {
       if (result.insufficientBars) {
@@ -1355,7 +1448,7 @@ async function scan() {
           return;
         }
 
-        // ── GAPPER ───────────────────────────────────────────────────
+       // ── GAPPER ───────────────────────────────────────────────────
         if (PREMARKET_ENABLED && c.pct >= PREMARKET_MIN_GAP) {
           const gapBreakout = pmHigh > 0 && c.price >= pmHigh;
 
