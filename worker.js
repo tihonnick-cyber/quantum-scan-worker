@@ -72,6 +72,7 @@ const TOP20_SMA_TREND_LOOKBACK = Number(process.env.TOP20_SMA_TREND_LOOKBACK || 
 const TOP20_REARM_MIN          = Number(process.env.TOP20_REARM_MIN          || 5);
 const TOP20_CONCURRENCY        = Number(process.env.TOP20_CONCURRENCY        || 10);
 const TOP20_BAR_LOOKBACK_MIN   = Number(process.env.TOP20_BAR_LOOKBACK_MIN   || 360);
+const TOP20_HISTORY_CALENDAR_DAYS = Number(process.env.TOP20_HISTORY_CALENDAR_DAYS || 7);
 const TOP20_MIN_BARS           = Number(process.env.TOP20_MIN_BARS           || 110);
 const TOP20_REQUIRE_HIGHER_CLOSES = process.env.TOP20_REQUIRE_HIGHER_CLOSES !== "false";
 
@@ -167,6 +168,7 @@ app.get("/health", async (_req, res) => {
           TOP20_REARM_MIN,
           TOP20_CONCURRENCY,
           TOP20_BAR_LOOKBACK_MIN,
+          TOP20_HISTORY_CALENDAR_DAYS,
           TOP20_MIN_BARS,
           TOP20_REQUIRE_HIGHER_CLOSES,
         },
@@ -226,11 +228,12 @@ app.get("/top20_test", async (_req, res) => {
       `Gainer Rank: <b>#1</b>\n` +
       `Volume: 1,250,000\n\n` +
       `✅ MACD Positive\n` +
-      `✅ 10 SMA crossed / recently crossed 100 SMA\n` +
+      `✅ 10 SMA > 100 SMA\n` +
       `✅ Volume ≥ 200K\n` +
       `✅ 3 Green 1m Candles + Higher Closes\n` +
       `✅ 100 SMA Trending Up\n\n` +
-      `⭐ <b>PERFECT SETUP — 5/5</b>`,
+      `⚡ <b>BONUS:</b> Fresh 10/100 SMA crossover 2m ago\n\n` +
+      `⭐ <b>PERFECT SETUP — 5/5 + CROSSOVER BONUS</b>`,
       { returnDebug: true }
     );
     res.json({ ok: true, result });
@@ -356,7 +359,7 @@ function formatEarlyTelegram({ ticker, price, pct, rvol, float, volumeAccel, vol
 
 function formatTop20Telegram(result) {
   const {
-    ticker, rank, price, pct, volume, score, criteria,
+    ticker, rank, price, pct, volume, score, criteria, bonus,
     macdLine, macdSignal, sma10, sma100, crossBarsAgo, sma100SlopePct,
   } = result;
 
@@ -365,9 +368,9 @@ function formatTop20Telegram(result) {
     ? `🔥 <b>TOP 20 TECHNICAL — 5/5</b>`
     : `🟠 <b>TOP 20 TECHNICAL — 4/5</b>`;
 
-  const crossDetail = criteria.smaCross
-    ? (crossBarsAgo === 0 ? "crossing now" : `crossed ${crossBarsAgo}m ago`)
-    : "not recent";
+  const bonusLine = bonus?.freshSmaCross
+    ? `⚡ <b>BONUS:</b> Fresh 10/100 SMA crossover ${crossBarsAgo === 0 ? "now" : `${crossBarsAgo}m ago`}\n`
+    : `➖ Bonus: No fresh 10/100 crossover in last ${TOP20_CROSS_LOOKBACK}m\n`;
 
   return (
     `${title}\n` +
@@ -376,14 +379,19 @@ function formatTop20Telegram(result) {
     `Volume: ${Math.round(volume).toLocaleString()}\n\n` +
     `${criteria.macdPositive ? "✅" : "❌"} MACD Positive ` +
       `(${Number(macdLine).toFixed(3)} / ${Number(macdSignal).toFixed(3)})\n` +
-    `${criteria.smaCross ? "✅" : "❌"} 10 SMA / 100 SMA — ${crossDetail}\n` +
+    `${criteria.sma10Above100 ? "✅" : "❌"} 10 SMA > 100 SMA\n` +
     `${criteria.volume ? "✅" : "❌"} Volume ≥ ${TOP20_MIN_VOLUME.toLocaleString()}\n` +
     `${criteria.threeGreen ? "✅" : "❌"} 3 Green 1m Candles + Bullish Progression\n` +
     `${criteria.sma100Up ? "✅" : "❌"} 100 SMA Trending Up (${Number(sma100SlopePct).toFixed(3)}%)\n\n` +
+    `${bonusLine}\n` +
     `SMA10: ${Number(sma10).toFixed(3)}   SMA100: ${Number(sma100).toFixed(3)}\n` +
     (score >= 5
-      ? `⭐ <b>PERFECT SETUP — 5/5</b>\n`
-      : `Setup Score: <b>${score}/5</b>\n`) +
+      ? (bonus?.freshSmaCross
+          ? `⭐ <b>PERFECT SETUP — 5/5 + CROSSOVER BONUS</b>\n`
+          : `⭐ <b>PERFECT SETUP — 5/5</b>\n`)
+      : (bonus?.freshSmaCross
+          ? `Setup Score: <b>${score}/5 + ⚡ crossover bonus</b>\n`
+          : `Setup Score: <b>${score}/5</b>\n`)) +
     `<a href="${tv}">Chart →</a>`
   );
 }
@@ -775,9 +783,15 @@ async function getTop20MinuteBars(ticker) {
   const cached = top20TechnicalBarCache.get(cacheKey);
   if (cached) return cached;
 
-  const cutoff = Date.now() - TOP20_BAR_LOOKBACK_MIN * 60_000;
+  // IMPORTANT:
+  // The 100-SMA needs at least 100 completed 1-minute bars. At 6:00 AM PT,
+  // thin premarket stocks may not have 110 bars from the current day alone.
+  // So fetch several CALENDAR days and use the most recent completed bars,
+  // which automatically carries the indicator history across prior sessions,
+  // weekends, and holidays.
   const currentMinuteStart = Math.floor(Date.now() / 60_000) * 60_000;
-  const from = new Date(cutoff).toISOString().slice(0, 10);
+  const historyStart = Date.now() - TOP20_HISTORY_CALENDAR_DAYS * 86_400_000;
+  const from = new Date(historyStart).toISOString().slice(0, 10);
   const to   = new Date().toISOString().slice(0, 10);
 
   const path =
@@ -786,7 +800,7 @@ async function getTop20MinuteBars(ticker) {
     `?adjusted=true&sort=asc&limit=50000`;
 
   const data = await massiveJson(path);
-  const bars = (data?.results || [])
+  let bars = (data?.results || [])
     .map(r => ({
       t: Number(r?.t || 0),
       o: Number(r?.o || 0),
@@ -796,11 +810,21 @@ async function getTop20MinuteBars(ticker) {
       v: Number(r?.v || 0),
     }))
     .filter(b =>
-      b.t >= cutoff &&
       b.t < currentMinuteStart &&
       b.o > 0 && b.h > 0 && b.l > 0 && b.c > 0
     )
     .sort((a, b) => a.t - b.t);
+
+  // Keep enough history for the 100-SMA, trend comparison, recent cross,
+  // MACD warm-up, and the latest candle pattern without carrying thousands
+  // of old bars through every calculation.
+  const minimumNeeded = Math.max(
+    TOP20_MIN_BARS,
+    100 + TOP20_SMA_TREND_LOOKBACK + TOP20_CROSS_LOOKBACK + 10,
+    60
+  );
+  const barsToKeep = Math.max(minimumNeeded + 100, 250);
+  if (bars.length > barsToKeep) bars = bars.slice(-barsToKeep);
 
   // Remove older cache keys for this ticker so memory stays small.
   for (const key of top20TechnicalBarCache.keys()) {
@@ -937,6 +961,7 @@ function evaluateTop20Technical(leader, bars) {
   const macd = computeMacd(closes);
   const cross = findRecentSmaCross(closes, 10, 100, TOP20_CROSS_LOOKBACK);
 
+  const currentSma10 = sma(closes, 10);
   const currentSma100 = sma(closes, 100);
   const pastEnd = closes.length - TOP20_SMA_TREND_LOOKBACK;
   const pastSma100 = sma(closes, 100, pastEnd);
@@ -946,13 +971,15 @@ function evaluateTop20Technical(leader, bars) {
       ? ((currentSma100 - pastSma100) / pastSma100) * 100
       : 0;
 
+  // Five CORE criteria determine the 4/5 or 5/5 setup score.
+  // The fresh 10/100 crossover is intentionally a BONUS only.
   const criteria = {
-    // "MACD positive" = bullish MACD: line is above signal and histogram is positive.
     macdPositive: Boolean(macd && macd.macd > macd.signal && macd.histogram > 0),
-
-    // Must be above AND the actual cross must have occurred within the configured recent window.
-    smaCross: Boolean(cross.passed),
-
+    sma10Above100: Boolean(
+      currentSma10 != null &&
+      currentSma100 != null &&
+      currentSma10 > currentSma100
+    ),
     volume: Number(leader.volume || 0) >= TOP20_MIN_VOLUME,
     threeGreen: evaluateThreeGreenBullish(bars),
     sma100Up: Boolean(
@@ -962,17 +989,22 @@ function evaluateTop20Technical(leader, bars) {
     ),
   };
 
+  const bonus = {
+    freshSmaCross: Boolean(cross.passed),
+  };
+
   const score = Object.values(criteria).filter(Boolean).length;
 
   return {
     ...leader,
     score,
     criteria,
+    bonus,
     macdLine: macd?.macd ?? 0,
     macdSignal: macd?.signal ?? 0,
     macdHistogram: macd?.histogram ?? 0,
-    sma10: cross.smaFast ?? sma(closes, 10) ?? 0,
-    sma100: cross.smaSlow ?? currentSma100 ?? 0,
+    sma10: currentSma10 ?? 0,
+    sma100: currentSma100 ?? 0,
     crossBarsAgo: cross.barsAgo,
     sma100SlopePct,
     barsAvailable: bars.length,
@@ -986,11 +1018,13 @@ const top20AlertState = new Map();
 function shouldSendTop20Alert(result) {
   const now = Date.now();
   const ticker = result.ticker;
+  const freshBonus = Boolean(result.bonus?.freshSmaCross);
   const state = top20AlertState.get(ticker) || {
     lastScore: 0,
     lastAlertScore: 0,
     lastAlertAt: 0,
     belowThresholdSince: 0,
+    lastBonus: false,
   };
 
   const score = result.score;
@@ -998,10 +1032,11 @@ function shouldSendTop20Alert(result) {
   if (score < TOP20_MIN_SCORE) {
     if (!state.belowThresholdSince) state.belowThresholdSince = now;
 
-    // Rearm after it has been below 4/5 for the configured number of minutes.
+    // Rearm after it has been below the qualifying threshold for the configured time.
     if (now - state.belowThresholdSince >= TOP20_REARM_MIN * 60_000) {
       state.lastAlertScore = 0;
       state.lastAlertAt = 0;
+      state.lastBonus = false;
     }
 
     state.lastScore = score;
@@ -1016,6 +1051,7 @@ function shouldSendTop20Alert(result) {
     state.lastScore = score;
     state.lastAlertScore = score;
     state.lastAlertAt = now;
+    state.lastBonus = freshBonus;
     top20AlertState.set(ticker, state);
     return true;
   }
@@ -1025,11 +1061,24 @@ function shouldSendTop20Alert(result) {
     state.lastScore = score;
     state.lastAlertScore = 5;
     state.lastAlertAt = now;
+    state.lastBonus = freshBonus;
+    top20AlertState.set(ticker, state);
+    return true;
+  }
+
+  // If the setup already qualified and a NEW fresh crossover appears later,
+  // send one bonus alert. The crossover does not change the 4/5 or 5/5 score.
+  if (freshBonus && !state.lastBonus) {
+    state.lastScore = score;
+    state.lastAlertScore = Math.max(state.lastAlertScore, score);
+    state.lastAlertAt = now;
+    state.lastBonus = true;
     top20AlertState.set(ticker, state);
     return true;
   }
 
   state.lastScore = score;
+  state.lastBonus = freshBonus;
   top20AlertState.set(ticker, state);
   return false;
 }
