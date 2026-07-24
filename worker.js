@@ -8,53 +8,72 @@ if (typeof fetch !== "function") {
 }
 
 const POLYGON_KEY        = process.env.POLYGON_KEY;
+const MASSIVE_API_KEY    = process.env.MASSIVE_API_KEY || POLYGON_KEY || "";
+const MASSIVE_API_BASE   = process.env.MASSIVE_API_BASE || "https://api.massive.com";
 const DATABASE_URL       = process.env.DATABASE_URL;
 const BASE44_INGEST_URL  = process.env.BASE44_INGEST_URL || "";
 const BASE44_API_KEY     = process.env.BASE44_API_KEY    || "";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || "";
 
-if (!POLYGON_KEY)  console.error("Missing env var: POLYGON_KEY");
-if (!DATABASE_URL) console.error("Missing env var: DATABASE_URL");
+if (!POLYGON_KEY)     console.error("Missing env var: POLYGON_KEY");
+if (!MASSIVE_API_KEY) console.error("Missing env var: MASSIVE_API_KEY (or POLYGON_KEY fallback)");
+if (!DATABASE_URL)    console.error("Missing env var: DATABASE_URL");
 
-// ===== CONFIG =====
+// ===== EXISTING SCANNER CONFIG =====
 const SCAN_INTERVAL_MS         = Number(process.env.SCAN_INTERVAL_MS         || 10000);
-const PRICE_MIN                 = Number(process.env.PRICE_MIN                 || 1);
-const PRICE_MAX                 = Number(process.env.PRICE_MAX                 || 12);
-const MAX_FLOAT                 = Number(process.env.MAX_FLOAT                 || 5_000_000);
-const AVG_VOL_DAYS              = Number(process.env.AVG_VOL_DAYS              || 30);
-const ALERT_COOLDOWN_MIN        = Number(process.env.ALERT_COOLDOWN_MIN        || 90);
-const MAX_CANDIDATES            = Number(process.env.MAX_CANDIDATES            || 500);
-const CONCURRENCY               = Number(process.env.CONCURRENCY               || 8);
-const NEWS_LOOKBACK_MIN         = Number(process.env.NEWS_LOOKBACK_MIN         || 1440);
-const SCAN_START_HOUR_PT        = Number(process.env.SCAN_START_HOUR_PT        || 4);
-const SCAN_END_HOUR_PT          = Number(process.env.SCAN_END_HOUR_PT          || 12);
-const MIN_MOMENTUM_SCORE        = Number(process.env.MIN_MOMENTUM_SCORE        || 78);
-const TOP_ALERTS_PER_SCAN       = Number(process.env.TOP_ALERTS_PER_SCAN       || 2);
-const LOW_FLOAT_THRESHOLD       = Number(process.env.LOW_FLOAT_THRESHOLD       || 2_000_000);
-const MID_FLOAT_THRESHOLD       = Number(process.env.MID_FLOAT_THRESHOLD       || 5_000_000);
-const EARLY_ALERTS_ENABLED      = process.env.EARLY_ALERTS_ENABLED    !== "false";
-const EARLY_MIN_PERCENT_CHANGE  = Number(process.env.EARLY_MIN_PERCENT_CHANGE  || 3);
-const EARLY_MIN_RVOL            = Number(process.env.EARLY_MIN_RVOL            || 50);
-const EARLY_MIN_ACCEL           = Number(process.env.EARLY_MIN_ACCEL           || 2);
-const RUNNER_ENABLED            = process.env.RUNNER_ENABLED           !== "false";
-const RUNNER_REQUIRE_NEWS       = process.env.RUNNER_REQUIRE_NEWS      === "true";
-const MIN_PERCENT_CHANGE        = Number(process.env.MIN_PERCENT_CHANGE        || 5);
-const RUNNER_MAX_PERCENT_CHANGE = Number(process.env.RUNNER_MAX_PERCENT_CHANGE || 80);
-const MIN_RVOL                  = Number(process.env.MIN_RVOL                  || 15);
-const RUNNER_MIN_VOL            = Number(process.env.RUNNER_MIN_VOL            || 500_000);
-const MIN_VOLUME_TREND          = Number(process.env.MIN_VOLUME_TREND          || 1.0);
-const PREMARKET_ENABLED         = process.env.PREMARKET_ENABLED        !== "false";
-const PREMARKET_MIN_GAP         = Number(process.env.PREMARKET_MIN_GAP         || 8);
-const PREMARKET_MIN_VOL         = Number(process.env.PREMARKET_MIN_VOL         || 150_000);
-const GAPPER_MIN_RVOL           = Number(process.env.GAPPER_MIN_RVOL           || 10);
-const PREMARKET_REQUIRE_NEWS    = process.env.PREMARKET_REQUIRE_NEWS   === "true";
-const PREMARKET_REQUIRE_SPIKE   = process.env.PREMARKET_REQUIRE_SPIKE  === "true";
-const VOLUME_SPIKE_MULTIPLIER   = Number(process.env.VOLUME_SPIKE_MULTIPLIER   || 2);
-const VOLUME_LOOKBACK_MIN       = Number(process.env.VOLUME_LOOKBACK_MIN       || 5);
-const VOLUME_BASELINE_MIN       = Number(process.env.VOLUME_BASELINE_MIN       || 30);
-const POLYGON_RETRY_ATTEMPTS    = Number(process.env.POLYGON_RETRY_ATTEMPTS    || 3);
-const POLYGON_RETRY_DELAY_MS    = Number(process.env.POLYGON_RETRY_DELAY_MS    || 200);
+const PRICE_MIN                = Number(process.env.PRICE_MIN                || 1);
+const PRICE_MAX                = Number(process.env.PRICE_MAX                || 12);
+const MAX_FLOAT                = Number(process.env.MAX_FLOAT                || 5_000_000);
+const AVG_VOL_DAYS             = Number(process.env.AVG_VOL_DAYS             || 30);
+const ALERT_COOLDOWN_MIN       = Number(process.env.ALERT_COOLDOWN_MIN       || 90);
+const MAX_CANDIDATES           = Number(process.env.MAX_CANDIDATES           || 500);
+const CONCURRENCY              = Number(process.env.CONCURRENCY              || 8);
+const NEWS_LOOKBACK_MIN        = Number(process.env.NEWS_LOOKBACK_MIN        || 1440);
+const SCAN_START_HOUR_PT       = Number(process.env.SCAN_START_HOUR_PT       || 4);
+const SCAN_END_HOUR_PT         = Number(process.env.SCAN_END_HOUR_PT         || 12);
+const MIN_MOMENTUM_SCORE       = Number(process.env.MIN_MOMENTUM_SCORE       || 78);
+const TOP_ALERTS_PER_SCAN      = Number(process.env.TOP_ALERTS_PER_SCAN      || 2);
+const LOW_FLOAT_THRESHOLD      = Number(process.env.LOW_FLOAT_THRESHOLD      || 2_000_000);
+const MID_FLOAT_THRESHOLD      = Number(process.env.MID_FLOAT_THRESHOLD      || 5_000_000);
+const EARLY_ALERTS_ENABLED     = process.env.EARLY_ALERTS_ENABLED !== "false";
+const EARLY_MIN_PERCENT_CHANGE = Number(process.env.EARLY_MIN_PERCENT_CHANGE || 3);
+const EARLY_MIN_RVOL           = Number(process.env.EARLY_MIN_RVOL           || 50);
+const EARLY_MIN_ACCEL          = Number(process.env.EARLY_MIN_ACCEL          || 2);
+const RUNNER_ENABLED           = process.env.RUNNER_ENABLED !== "false";
+const RUNNER_REQUIRE_NEWS      = process.env.RUNNER_REQUIRE_NEWS === "true";
+const MIN_PERCENT_CHANGE       = Number(process.env.MIN_PERCENT_CHANGE       || 5);
+const RUNNER_MAX_PERCENT_CHANGE= Number(process.env.RUNNER_MAX_PERCENT_CHANGE|| 80);
+const MIN_RVOL                 = Number(process.env.MIN_RVOL                 || 15);
+const RUNNER_MIN_VOL           = Number(process.env.RUNNER_MIN_VOL           || 500_000);
+const MIN_VOLUME_TREND         = Number(process.env.MIN_VOLUME_TREND         || 1.0);
+const PREMARKET_ENABLED        = process.env.PREMARKET_ENABLED !== "false";
+const PREMARKET_MIN_GAP        = Number(process.env.PREMARKET_MIN_GAP        || 8);
+const PREMARKET_MIN_VOL        = Number(process.env.PREMARKET_MIN_VOL        || 150_000);
+const GAPPER_MIN_RVOL          = Number(process.env.GAPPER_MIN_RVOL          || 10);
+const PREMARKET_REQUIRE_NEWS   = process.env.PREMARKET_REQUIRE_NEWS === "true";
+const PREMARKET_REQUIRE_SPIKE  = process.env.PREMARKET_REQUIRE_SPIKE === "true";
+const VOLUME_SPIKE_MULTIPLIER  = Number(process.env.VOLUME_SPIKE_MULTIPLIER  || 2);
+const VOLUME_LOOKBACK_MIN      = Number(process.env.VOLUME_LOOKBACK_MIN      || 5);
+const VOLUME_BASELINE_MIN      = Number(process.env.VOLUME_BASELINE_MIN      || 30);
+const POLYGON_RETRY_ATTEMPTS   = Number(process.env.POLYGON_RETRY_ATTEMPTS   || 3);
+const POLYGON_RETRY_DELAY_MS   = Number(process.env.POLYGON_RETRY_DELAY_MS   || 200);
+
+// ===== NEW TOP-20 TECHNICAL SCANNER CONFIG =====
+// This scanner is Telegram-only. It does NOT write to Base44 or the alerts DB.
+const TOP20_ENABLED            = process.env.TOP20_ENABLED !== "false";
+const TOP20_SCAN_INTERVAL_MS   = Number(process.env.TOP20_SCAN_INTERVAL_MS   || 10000);
+const TOP20_START_HOUR_PT      = Number(process.env.TOP20_START_HOUR_PT      || 6);
+const TOP20_END_HOUR_PT        = Number(process.env.TOP20_END_HOUR_PT        || 14);
+const TOP20_MIN_SCORE          = Number(process.env.TOP20_MIN_SCORE          || 4);
+const TOP20_MIN_VOLUME         = Number(process.env.TOP20_MIN_VOLUME         || 200_000);
+const TOP20_CROSS_LOOKBACK     = Number(process.env.TOP20_CROSS_LOOKBACK     || 5);
+const TOP20_SMA_TREND_LOOKBACK = Number(process.env.TOP20_SMA_TREND_LOOKBACK || 5);
+const TOP20_REARM_MIN          = Number(process.env.TOP20_REARM_MIN          || 5);
+const TOP20_CONCURRENCY        = Number(process.env.TOP20_CONCURRENCY        || 10);
+const TOP20_BAR_LOOKBACK_MIN   = Number(process.env.TOP20_BAR_LOOKBACK_MIN   || 360);
+const TOP20_MIN_BARS           = Number(process.env.TOP20_MIN_BARS           || 110);
+const TOP20_REQUIRE_HIGHER_CLOSES = process.env.TOP20_REQUIRE_HIGHER_CLOSES !== "false";
 
 // ===== DB =====
 const pool = new Pool({
@@ -81,6 +100,16 @@ let totalAlertsCreated = 0;
 let scanRuns           = 0;
 let _scanStats         = {};
 
+let top20IsScanning         = false;
+let top20LastError          = null;
+let top20LastStartedAt      = null;
+let top20LastFinishedAt     = null;
+let top20LastDurationMs     = null;
+let top20ScanRuns           = 0;
+let top20AlertsSent         = 0;
+let top20LastLeaders        = [];
+let top20LastStats          = {};
+
 // ===== ROUTES =====
 app.get("/", (_req, res) => res.send("Quantum Scan Worker is running"));
 
@@ -102,7 +131,8 @@ app.get("/health", async (_req, res) => {
       scanRuns,
       lastScanStats: _scanStats,
       telegramEnabled: Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
-      base44Enabled:   Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
+      base44Enabled: Boolean(BASE44_INGEST_URL && BASE44_API_KEY),
+      massiveEnabled: Boolean(MASSIVE_API_KEY),
       config: {
         PRICE_MIN, PRICE_MAX, MAX_FLOAT, AVG_VOL_DAYS,
         ALERT_COOLDOWN_MIN, MAX_CANDIDATES, CONCURRENCY, NEWS_LOOKBACK_MIN,
@@ -114,6 +144,32 @@ app.get("/health", async (_req, res) => {
         PREMARKET_ENABLED, PREMARKET_MIN_GAP, PREMARKET_MIN_VOL, GAPPER_MIN_RVOL,
         PREMARKET_REQUIRE_NEWS, PREMARKET_REQUIRE_SPIKE,
         VOLUME_SPIKE_MULTIPLIER, VOLUME_LOOKBACK_MIN, VOLUME_BASELINE_MIN,
+      },
+      top20Technical: {
+        enabled: TOP20_ENABLED,
+        isScanning: top20IsScanning,
+        scanIntervalMs: TOP20_SCAN_INTERVAL_MS,
+        lastError: top20LastError,
+        lastStartedAt: top20LastStartedAt,
+        lastFinishedAt: top20LastFinishedAt,
+        lastDurationMs: top20LastDurationMs,
+        scanRuns: top20ScanRuns,
+        alertsSent: top20AlertsSent,
+        lastLeaders: top20LastLeaders,
+        lastStats: top20LastStats,
+        config: {
+          TOP20_START_HOUR_PT,
+          TOP20_END_HOUR_PT,
+          TOP20_MIN_SCORE,
+          TOP20_MIN_VOLUME,
+          TOP20_CROSS_LOOKBACK,
+          TOP20_SMA_TREND_LOOKBACK,
+          TOP20_REARM_MIN,
+          TOP20_CONCURRENCY,
+          TOP20_BAR_LOOKBACK_MIN,
+          TOP20_MIN_BARS,
+          TOP20_REQUIRE_HIGHER_CLOSES,
+        },
       },
     });
   } catch (e) {
@@ -162,6 +218,27 @@ app.get("/telegram_test", async (_req, res) => {
   }
 });
 
+app.get("/top20_test", async (_req, res) => {
+  try {
+    const result = await pushToTelegram(
+      `🔥 <b>TOP 20 TECHNICAL — TEST 5/5</b>\n` +
+      `<b>TEST</b>  $5.25  (<b>+22.50%</b>)\n` +
+      `Gainer Rank: <b>#1</b>\n` +
+      `Volume: 1,250,000\n\n` +
+      `✅ MACD Positive\n` +
+      `✅ 10 SMA crossed / recently crossed 100 SMA\n` +
+      `✅ Volume ≥ 200K\n` +
+      `✅ 3 Green 1m Candles + Higher Closes\n` +
+      `✅ 100 SMA Trending Up\n\n` +
+      `⭐ <b>PERFECT SETUP — 5/5</b>`,
+      { returnDebug: true }
+    );
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ===== DB HELPERS =====
 async function insertAlert({ ticker, price, percent_change, rvol, float, news, alert_type, meta }) {
   const result = await pool.query(
@@ -172,7 +249,8 @@ async function insertAlert({ ticker, price, percent_change, rvol, float, news, a
   return result.rows[0];
 }
 
-// FIX: cross-type cooldown — any alert on ticker blocks all types
+// Existing scanner cross-type cooldown — any DB alert on ticker blocks all existing alert types.
+// The new TOP20 scanner intentionally does NOT use this function, so it remains independent.
 async function wasAlertedRecently(ticker) {
   const result = await pool.query(
     `SELECT 1 FROM alerts
@@ -276,6 +354,40 @@ function formatEarlyTelegram({ ticker, price, pct, rvol, float, volumeAccel, vol
   );
 }
 
+function formatTop20Telegram(result) {
+  const {
+    ticker, rank, price, pct, volume, score, criteria,
+    macdLine, macdSignal, sma10, sma100, crossBarsAgo, sma100SlopePct,
+  } = result;
+
+  const tv = `https://www.tradingview.com/symbols/${encodeURIComponent(ticker)}/`;
+  const title = score >= 5
+    ? `🔥 <b>TOP 20 TECHNICAL — 5/5</b>`
+    : `🟠 <b>TOP 20 TECHNICAL — 4/5</b>`;
+
+  const crossDetail = criteria.smaCross
+    ? (crossBarsAgo === 0 ? "crossing now" : `crossed ${crossBarsAgo}m ago`)
+    : "not recent";
+
+  return (
+    `${title}\n` +
+    `<b>${ticker}</b>  $${Number(price).toFixed(2)}  (<b>${Number(pct).toFixed(2)}%</b>)\n` +
+    `Gainer Rank: <b>#${rank}</b>\n` +
+    `Volume: ${Math.round(volume).toLocaleString()}\n\n` +
+    `${criteria.macdPositive ? "✅" : "❌"} MACD Positive ` +
+      `(${Number(macdLine).toFixed(3)} / ${Number(macdSignal).toFixed(3)})\n` +
+    `${criteria.smaCross ? "✅" : "❌"} 10 SMA / 100 SMA — ${crossDetail}\n` +
+    `${criteria.volume ? "✅" : "❌"} Volume ≥ ${TOP20_MIN_VOLUME.toLocaleString()}\n` +
+    `${criteria.threeGreen ? "✅" : "❌"} 3 Green 1m Candles + Bullish Progression\n` +
+    `${criteria.sma100Up ? "✅" : "❌"} 100 SMA Trending Up (${Number(sma100SlopePct).toFixed(3)}%)\n\n` +
+    `SMA10: ${Number(sma10).toFixed(3)}   SMA100: ${Number(sma100).toFixed(3)}\n` +
+    (score >= 5
+      ? `⭐ <b>PERFECT SETUP — 5/5</b>\n`
+      : `Setup Score: <b>${score}/5</b>\n`) +
+    `<a href="${tv}">Chart →</a>`
+  );
+}
+
 // ===== CACHE =====
 const cache = {
   avgVol:     new Map(),
@@ -299,7 +411,16 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ===== POLYGON =====
+function pacificHourNow() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles",
+    hour: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+  return Number(parts.find(p => p.type === "hour")?.value || 0);
+}
+
+// ===== POLYGON (EXISTING SCANNER) =====
 async function polygonJson(url, attempt = 0) {
   let resp;
   try {
@@ -360,10 +481,8 @@ function computePercentChange(t) {
 
 // SPEED: use prevDay.v from snapshot as avg vol baseline — skips API call
 async function getAvgDailyVolume(ticker, prevDayVol = 0) {
-  // Use snapshot prevDay volume as fast baseline
   if (prevDayVol > 0) return prevDayVol;
 
-  // Fall back to API only if snapshot had no prevDay vol
   const cached = getCache(cache.avgVol, ticker);
   if (cached != null) return cached;
 
@@ -400,16 +519,15 @@ async function getFloatInfo(ticker) {
     const data = await polygonJson(url);
     const res  = data?.results || {};
     const payload = {
-      float:             Number(res?.float || 0),
+      float: Number(res?.float || 0),
       sharesOutstanding: Number(
         res?.share_class_shares_outstanding ||
-        res?.weighted_shares_outstanding    || 0
+        res?.weighted_shares_outstanding || 0
       ),
     };
     setCache(cache.float, ticker, payload, 24 * 3_600_000);
     return payload;
   } catch (e) {
-    // Don't crash on 404 dead tickers — return empty and let float filter skip it
     if (!e.message.includes("404")) {
       console.error(`[${ticker}] getFloatInfo error:`, e.message);
     }
@@ -457,9 +575,11 @@ async function getMinuteAggs(ticker, minutesBack) {
     .filter(r => Number(r?.t || 0) >= cutoff)
     .map(r => ({
       t: Number(r.t),
-      v: Number(r.v || 0),
+      o: Number(r.o || 0),
       h: Number(r.h || 0),
+      l: Number(r.l || 0),
       c: Number(r.c || 0),
+      v: Number(r.v || 0),
     }));
 
   setCache(cache.minuteAggs, cacheKey, filtered, 20_000);
@@ -487,7 +607,6 @@ async function computePremarketVolumeAndSpike(ticker) {
   const pmHigh = sortedAsc.length
     ? Math.max(...sortedAsc.map(b => b.h || 0)) : 0;
 
-  // Freshness: last 3 min vs prior 12 min
   const recentBars  = sortedAsc.slice(-3);
   const earlierBars = sortedAsc.slice(-15, -3);
   const recentAvg   = recentBars.length
@@ -503,7 +622,6 @@ async function computePremarketVolumeAndSpike(ticker) {
 function computeMomentumScore({ pct, rvol, volumeAccel, volumeTrend, float, news, breakout }) {
   let score = 0;
 
-  // RVOL — tiered, extreme RVOL rewarded heavily
   score += rvol >= 200 ? 40
          : rvol >= 100 ? 35
          : rvol >= 50  ? 28
@@ -511,7 +629,6 @@ function computeMomentumScore({ pct, rvol, volumeAccel, volumeTrend, float, news
          : rvol >= 10  ? 12
          : rvol >= 5   ? 6 : 0;
 
-  // % change — early movers score highest, extended moves penalized
   score += pct < 5   ? 0
          : pct < 15  ? Math.min(pct * 1.2, 18)
          : pct < 30  ? 15
@@ -519,20 +636,17 @@ function computeMomentumScore({ pct, rvol, volumeAccel, volumeTrend, float, news
          : pct < 100 ? 5
          : 0;
 
-  // Volume acceleration
   score += volumeAccel > 4    ? 20
          : volumeAccel > 3    ? 15
          : volumeAccel > 2    ? 10
          : volumeAccel > 1.25 ? 5 : 0;
 
-  // Volume trend — last 3 min vs prior 12 min
   score += volumeTrend > 2.0 ? 15
          : volumeTrend > 1.5 ? 10
          : volumeTrend > 1.0 ? 5
          : volumeTrend < 0.7 ? -15
          : 0;
 
-  // Float
   score += float < LOW_FLOAT_THRESHOLD ? 15
          : float < MID_FLOAT_THRESHOLD ? 8
          : float < MAX_FLOAT           ? 3 : 0;
@@ -543,7 +657,7 @@ function computeMomentumScore({ pct, rvol, volumeAccel, volumeTrend, float, news
   return score;
 }
 
-// ===== COOLDOWN =====
+// ===== EXISTING SCANNER COOLDOWN =====
 const cooldownMap = new Map();
 
 function inCooldown(key) {
@@ -557,7 +671,6 @@ function setCooldown(key) {
   cooldownMap.set(key, Date.now() + ALERT_COOLDOWN_MIN * 60_000);
 }
 
-// Cross-type cooldown — if ticker fired as ANY type, block all types
 function tickerInAnyCooldown(ticker) {
   const types = ["EARLY", "RUNNER", "GAPPER", "PM_BREAKOUT", "LOW_FLOAT_SQUEEZE"];
   return types.some(t => inCooldown(`${ticker}:${t}`));
@@ -579,14 +692,442 @@ async function runWithConcurrency(items, limit, workerFn) {
   return results;
 }
 
-// ===== SCANNER =====
+// ============================================================================
+// NEW TOP-20 TECHNICAL SCANNER (MASSIVE -> RAILWAY -> TELEGRAM ONLY)
+// ============================================================================
+
+async function massiveJson(pathOrUrl, attempt = 0) {
+  let url = pathOrUrl.startsWith("http")
+    ? pathOrUrl
+    : `${MASSIVE_API_BASE}${pathOrUrl}`;
+
+  if (!url.includes("apiKey=")) {
+    url += `${url.includes("?") ? "&" : "?"}apiKey=${encodeURIComponent(MASSIVE_API_KEY)}`;
+  }
+
+  let resp;
+  try {
+    resp = await fetch(url);
+  } catch (e) {
+    if (attempt < POLYGON_RETRY_ATTEMPTS - 1) {
+      await sleep(POLYGON_RETRY_DELAY_MS * (attempt + 1));
+      return massiveJson(pathOrUrl, attempt + 1);
+    }
+    throw e;
+  }
+
+  if (resp.status === 429 || resp.status >= 500) {
+    if (attempt < POLYGON_RETRY_ATTEMPTS - 1) {
+      const retryAfter =
+        Number(resp.headers.get("retry-after") || 0) * 1000 ||
+        POLYGON_RETRY_DELAY_MS * (attempt + 1);
+      await sleep(retryAfter);
+      return massiveJson(pathOrUrl, attempt + 1);
+    }
+  }
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Massive ${resp.status}: ${text.slice(0, 400)}`);
+  }
+
+  return resp.json();
+}
+
+async function fetchTop20Gainers() {
+  const data = await massiveJson(
+    "/v2/snapshot/locale/us/markets/stocks/gainers"
+  );
+
+  const tickers = Array.isArray(data?.tickers) ? data.tickers : [];
+
+  return tickers.slice(0, 20).map((t, index) => {
+    const price =
+      Number(t?.lastTrade?.p) ||
+      Number(t?.day?.c) ||
+      Number(t?.prevDay?.c) || 0;
+
+    const pct = Number.isFinite(Number(t?.todaysChangePerc))
+      ? Number(t.todaysChangePerc)
+      : computePercentChange(t);
+
+    return {
+      rank: index + 1,
+      ticker: String(t?.ticker || "").toUpperCase(),
+      price,
+      pct,
+      volume: Number(t?.day?.v || 0),
+    };
+  }).filter(x => x.ticker && x.price > 0 && /^[A-Z]{1,5}$/.test(x.ticker));
+}
+
+// Cache technical bars until the next completed 1-minute candle.
+// This keeps the scanner fast without re-downloading 100+ bars every 10 seconds.
+const top20TechnicalBarCache = new Map();
+
+function completedMinuteKey() {
+  return Math.floor(Date.now() / 60_000) - 1;
+}
+
+async function getTop20MinuteBars(ticker) {
+  const minuteKey = completedMinuteKey();
+  const cacheKey = `${ticker}:${minuteKey}`;
+  const cached = top20TechnicalBarCache.get(cacheKey);
+  if (cached) return cached;
+
+  const cutoff = Date.now() - TOP20_BAR_LOOKBACK_MIN * 60_000;
+  const currentMinuteStart = Math.floor(Date.now() / 60_000) * 60_000;
+  const from = new Date(cutoff).toISOString().slice(0, 10);
+  const to   = new Date().toISOString().slice(0, 10);
+
+  const path =
+    `/v2/aggs/ticker/${encodeURIComponent(ticker)}` +
+    `/range/1/minute/${from}/${to}` +
+    `?adjusted=true&sort=asc&limit=50000`;
+
+  const data = await massiveJson(path);
+  const bars = (data?.results || [])
+    .map(r => ({
+      t: Number(r?.t || 0),
+      o: Number(r?.o || 0),
+      h: Number(r?.h || 0),
+      l: Number(r?.l || 0),
+      c: Number(r?.c || 0),
+      v: Number(r?.v || 0),
+    }))
+    .filter(b =>
+      b.t >= cutoff &&
+      b.t < currentMinuteStart &&
+      b.o > 0 && b.h > 0 && b.l > 0 && b.c > 0
+    )
+    .sort((a, b) => a.t - b.t);
+
+  // Remove older cache keys for this ticker so memory stays small.
+  for (const key of top20TechnicalBarCache.keys()) {
+    if (key.startsWith(`${ticker}:`) && key !== cacheKey) {
+      top20TechnicalBarCache.delete(key);
+    }
+  }
+
+  top20TechnicalBarCache.set(cacheKey, bars);
+  return bars;
+}
+
+function sma(values, period, endExclusive = values.length) {
+  if (period <= 0 || endExclusive < period) return null;
+  const start = endExclusive - period;
+  let sum = 0;
+  for (let i = start; i < endExclusive; i++) sum += values[i];
+  return sum / period;
+}
+
+function emaSeries(values, period) {
+  if (!Array.isArray(values) || values.length < period || period <= 0) return [];
+
+  const out = new Array(values.length).fill(null);
+  const seed = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  out[period - 1] = seed;
+
+  const k = 2 / (period + 1);
+  for (let i = period; i < values.length; i++) {
+    out[i] = values[i] * k + out[i - 1] * (1 - k);
+  }
+  return out;
+}
+
+function computeMacd(values, fastPeriod = 12, slowPeriod = 26, signalPeriod = 9) {
+  if (values.length < slowPeriod + signalPeriod) return null;
+
+  const fast = emaSeries(values, fastPeriod);
+  const slow = emaSeries(values, slowPeriod);
+  const macd = values.map((_, i) =>
+    fast[i] != null && slow[i] != null ? fast[i] - slow[i] : null
+  );
+
+  const validMacd = macd.filter(v => v != null);
+  if (validMacd.length < signalPeriod) return null;
+
+  const signalValid = emaSeries(validMacd, signalPeriod);
+  const signal = new Array(values.length).fill(null);
+  let validIndex = 0;
+  for (let i = 0; i < macd.length; i++) {
+    if (macd[i] != null) {
+      signal[i] = signalValid[validIndex];
+      validIndex++;
+    }
+  }
+
+  const last = values.length - 1;
+  if (macd[last] == null || signal[last] == null) return null;
+
+  return {
+    macd: macd[last],
+    signal: signal[last],
+    histogram: macd[last] - signal[last],
+  };
+}
+
+function findRecentSmaCross(closes, fastPeriod, slowPeriod, lookbackBars) {
+  if (closes.length < slowPeriod + lookbackBars + 1) {
+    return { passed: false, barsAgo: null, smaFast: null, smaSlow: null };
+  }
+
+  const currentFast = sma(closes, fastPeriod);
+  const currentSlow = sma(closes, slowPeriod);
+  if (currentFast == null || currentSlow == null || currentFast <= currentSlow) {
+    return { passed: false, barsAgo: null, smaFast: currentFast, smaSlow: currentSlow };
+  }
+
+  const maxLookback = Math.min(lookbackBars, closes.length - slowPeriod - 1);
+
+  for (let barsAgo = 0; barsAgo <= maxLookback; barsAgo++) {
+    const currEnd = closes.length - barsAgo;
+    const prevEnd = currEnd - 1;
+    const currFast = sma(closes, fastPeriod, currEnd);
+    const currSlow = sma(closes, slowPeriod, currEnd);
+    const prevFast = sma(closes, fastPeriod, prevEnd);
+    const prevSlow = sma(closes, slowPeriod, prevEnd);
+
+    if (
+      currFast != null && currSlow != null &&
+      prevFast != null && prevSlow != null &&
+      currFast > currSlow && prevFast <= prevSlow
+    ) {
+      return {
+        passed: true,
+        barsAgo,
+        smaFast: currentFast,
+        smaSlow: currentSlow,
+      };
+    }
+  }
+
+  return {
+    passed: false,
+    barsAgo: null,
+    smaFast: currentFast,
+    smaSlow: currentSlow,
+  };
+}
+
+function evaluateThreeGreenBullish(bars) {
+  if (bars.length < 3) return false;
+  const [a, b, c] = bars.slice(-3);
+
+  const allGreen = a.c > a.o && b.c > b.o && c.c > c.o;
+  if (!allGreen) return false;
+
+  if (!TOP20_REQUIRE_HIGHER_CLOSES) return true;
+
+  // Bullish progression: each green candle closes higher than the prior candle.
+  return a.c < b.c && b.c < c.c;
+}
+
+function evaluateTop20Technical(leader, bars) {
+  if (!bars || bars.length < TOP20_MIN_BARS) {
+    return {
+      ...leader,
+      insufficientBars: true,
+      barsAvailable: bars?.length || 0,
+      score: 0,
+    };
+  }
+
+  const closes = bars.map(b => b.c);
+  const macd = computeMacd(closes);
+  const cross = findRecentSmaCross(closes, 10, 100, TOP20_CROSS_LOOKBACK);
+
+  const currentSma100 = sma(closes, 100);
+  const pastEnd = closes.length - TOP20_SMA_TREND_LOOKBACK;
+  const pastSma100 = sma(closes, 100, pastEnd);
+
+  const sma100SlopePct =
+    currentSma100 != null && pastSma100 != null && pastSma100 !== 0
+      ? ((currentSma100 - pastSma100) / pastSma100) * 100
+      : 0;
+
+  const criteria = {
+    // "MACD positive" = bullish MACD: line is above signal and histogram is positive.
+    macdPositive: Boolean(macd && macd.macd > macd.signal && macd.histogram > 0),
+
+    // Must be above AND the actual cross must have occurred within the configured recent window.
+    smaCross: Boolean(cross.passed),
+
+    volume: Number(leader.volume || 0) >= TOP20_MIN_VOLUME,
+    threeGreen: evaluateThreeGreenBullish(bars),
+    sma100Up: Boolean(
+      currentSma100 != null &&
+      pastSma100 != null &&
+      currentSma100 > pastSma100
+    ),
+  };
+
+  const score = Object.values(criteria).filter(Boolean).length;
+
+  return {
+    ...leader,
+    score,
+    criteria,
+    macdLine: macd?.macd ?? 0,
+    macdSignal: macd?.signal ?? 0,
+    macdHistogram: macd?.histogram ?? 0,
+    sma10: cross.smaFast ?? sma(closes, 10) ?? 0,
+    sma100: cross.smaSlow ?? currentSma100 ?? 0,
+    crossBarsAgo: cross.barsAgo,
+    sma100SlopePct,
+    barsAvailable: bars.length,
+    insufficientBars: false,
+  };
+}
+
+// Separate state so TOP20 alerts do not interfere with your existing scanner cooldowns.
+const top20AlertState = new Map();
+
+function shouldSendTop20Alert(result) {
+  const now = Date.now();
+  const ticker = result.ticker;
+  const state = top20AlertState.get(ticker) || {
+    lastScore: 0,
+    lastAlertScore: 0,
+    lastAlertAt: 0,
+    belowThresholdSince: 0,
+  };
+
+  const score = result.score;
+
+  if (score < TOP20_MIN_SCORE) {
+    if (!state.belowThresholdSince) state.belowThresholdSince = now;
+
+    // Rearm after it has been below 4/5 for the configured number of minutes.
+    if (now - state.belowThresholdSince >= TOP20_REARM_MIN * 60_000) {
+      state.lastAlertScore = 0;
+      state.lastAlertAt = 0;
+    }
+
+    state.lastScore = score;
+    top20AlertState.set(ticker, state);
+    return false;
+  }
+
+  state.belowThresholdSince = 0;
+
+  // First qualifying 4/5 or 5/5 alert.
+  if (state.lastAlertScore < TOP20_MIN_SCORE) {
+    state.lastScore = score;
+    state.lastAlertScore = score;
+    state.lastAlertAt = now;
+    top20AlertState.set(ticker, state);
+    return true;
+  }
+
+  // Upgrade from 4/5 to 5/5 immediately.
+  if (score === 5 && state.lastAlertScore < 5) {
+    state.lastScore = score;
+    state.lastAlertScore = 5;
+    state.lastAlertAt = now;
+    top20AlertState.set(ticker, state);
+    return true;
+  }
+
+  state.lastScore = score;
+  top20AlertState.set(ticker, state);
+  return false;
+}
+
+async function scanTop20Technicals() {
+  if (!TOP20_ENABLED) return;
+
+  const hour = pacificHourNow();
+  if (hour < TOP20_START_HOUR_PT || hour >= TOP20_END_HOUR_PT) return;
+
+  if (top20IsScanning) return;
+  top20IsScanning = true;
+  top20ScanRuns++;
+  top20LastStartedAt = new Date().toISOString();
+  top20LastError = null;
+  const started = Date.now();
+
+  let leadersFetched = 0;
+  let analyzed = 0;
+  let insufficientBars = 0;
+  let qualifying4 = 0;
+  let qualifying5 = 0;
+  let alertsThisRun = 0;
+
+  try {
+    const leaders = await fetchTop20Gainers();
+    leadersFetched = leaders.length;
+    top20LastLeaders = leaders.map(x => ({
+      rank: x.rank,
+      ticker: x.ticker,
+      price: Number(x.price.toFixed(4)),
+      pct: Number(x.pct.toFixed(2)),
+      volume: Math.round(x.volume),
+    }));
+
+    const evaluated = await runWithConcurrency(
+      leaders,
+      TOP20_CONCURRENCY,
+      async leader => {
+        try {
+          const bars = await getTop20MinuteBars(leader.ticker);
+          const result = evaluateTop20Technical(leader, bars);
+          return result;
+        } catch (e) {
+          console.error(`[TOP20][${leader.ticker}] error:`, e.message);
+          return null;
+        }
+      }
+    );
+
+    for (const result of evaluated.filter(Boolean)) {
+      if (result.insufficientBars) {
+        insufficientBars++;
+        continue;
+      }
+
+      analyzed++;
+      if (result.score === 4) qualifying4++;
+      if (result.score === 5) qualifying5++;
+
+      if (result.score >= TOP20_MIN_SCORE && shouldSendTop20Alert(result)) {
+        await pushToTelegram(formatTop20Telegram(result));
+        alertsThisRun++;
+        top20AlertsSent++;
+        console.log(
+          `[TOP20][ALERT] #${result.rank} ${result.ticker} ` +
+          `score=${result.score}/5 pct=${result.pct.toFixed(2)} vol=${Math.round(result.volume)}`
+        );
+      } else if (result.score < TOP20_MIN_SCORE) {
+        // Update/rearm state for non-qualifying names.
+        shouldSendTop20Alert(result);
+      }
+    }
+  } catch (e) {
+    top20LastError = e.message;
+    console.error("TOP20 scan error:", e.message);
+  } finally {
+    top20LastFinishedAt = new Date().toISOString();
+    top20LastDurationMs = Date.now() - started;
+    top20LastStats = {
+      leadersFetched,
+      analyzed,
+      insufficientBars,
+      qualifying4,
+      qualifying5,
+      alertsThisRun,
+    };
+    top20IsScanning = false;
+  }
+}
+
+// ============================================================================
+// EXISTING SCANNER
+// ============================================================================
 async function scan() {
   lastLoopAt = new Date().toISOString();
 
-  const pacific = new Date(
-    new Date().toLocaleString("en-US", { timeZone: "America/Los_Angeles" })
-  );
-  const hour = pacific.getHours();
+  const hour = pacificHourNow();
 
   if (hour < SCAN_START_HOUR_PT || hour >= SCAN_END_HOUR_PT) {
     console.log(`Outside scan window (${SCAN_START_HOUR_PT}–${SCAN_END_HOUR_PT} PT). Skipping.`);
@@ -629,11 +1170,11 @@ async function scan() {
           Number(t?.prevDay?.c)   || 0;
         const pct        = computePercentChange(t);
         const dayVol     = Number(t?.day?.v     || 0);
-        const prevDayVol = Number(t?.prevDay?.v || 0); // SPEED: snapshot baseline
+        const prevDayVol = Number(t?.prevDay?.v || 0);
         return { symbol, price, pct, dayVol, prevDayVol };
       })
       .filter(x => x.symbol && x.price > 0 && x.price >= PRICE_MIN && x.price <= PRICE_MAX)
-      .filter(x => /^[A-Z]{1,5}$/.test(x.symbol)); // filter dead/OTC tickers
+      .filter(x => /^[A-Z]{1,5}$/.test(x.symbol));
 
     candidatesFound = raw.length;
     raw.sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct));
@@ -646,7 +1187,6 @@ async function scan() {
     await runWithConcurrency(raw, CONCURRENCY, async (c) => {
       const ticker = c.symbol;
       try {
-        // SPEED: skip entire ticker if already in cooldown
         if (tickerInAnyCooldown(ticker)) return;
 
         const floatInfo      = await getFloatInfo(ticker);
@@ -656,7 +1196,6 @@ async function scan() {
 
         if (!effectiveFloat || effectiveFloat > MAX_FLOAT) return;
 
-        // SPEED: use prevDay vol from snapshot, API call only as fallback
         const avgVol = await getAvgDailyVolume(ticker, c.prevDayVol);
         if (!avgVol || avgVol <= 0) return;
 
@@ -669,8 +1208,8 @@ async function scan() {
           const pm    = await computePremarketVolumeAndSpike(ticker);
           volumeAccel     = Number(pm.spikeMultiplier || 0);
           spikeMultiplier = volumeAccel;
-          pmHigh          = Number(pm.pmHigh     || 0);
-          totalVol        = Number(pm.totalVol   || 0);
+          pmHigh          = Number(pm.pmHigh || 0);
+          totalVol        = Number(pm.totalVol || 0);
           volumeTrend     = Number(pm.volumeTrend || 1);
           breakout        = pmHigh > 0 && c.price >= pmHigh;
         } catch { /* non-fatal */ }
@@ -683,9 +1222,9 @@ async function scan() {
 
         // ── EARLY ALERT ──────────────────────────────────────────────
         if (
-          EARLY_ALERTS_ENABLED                     &&
-          c.pct       >= EARLY_MIN_PERCENT_CHANGE  &&
-          rvol        >= EARLY_MIN_RVOL            &&
+          EARLY_ALERTS_ENABLED &&
+          c.pct       >= EARLY_MIN_PERCENT_CHANGE &&
+          rvol        >= EARLY_MIN_RVOL &&
           volumeAccel >= EARLY_MIN_ACCEL
         ) {
           const key = `${ticker}:EARLY`;
@@ -705,22 +1244,23 @@ async function scan() {
 
         // ── RUNNER ───────────────────────────────────────────────────
         if (
-          RUNNER_ENABLED                         &&
-          c.pct    >= MIN_PERCENT_CHANGE         &&
-          c.pct    <= RUNNER_MAX_PERCENT_CHANGE  &&
-          c.dayVol >= RUNNER_MIN_VOL             &&
+          RUNNER_ENABLED &&
+          c.pct    >= MIN_PERCENT_CHANGE &&
+          c.pct    <= RUNNER_MAX_PERCENT_CHANGE &&
+          c.dayVol >= RUNNER_MIN_VOL &&
           rvol     >= MIN_RVOL
         ) {
-          if (RUNNER_REQUIRE_NEWS && !newsOk)   return;
-          if (volumeTrend < MIN_VOLUME_TREND)   return;
-          if (baseScore   < MIN_MOMENTUM_SCORE) return;
+          if (RUNNER_REQUIRE_NEWS && !newsOk) return;
+          if (volumeTrend < MIN_VOLUME_TREND) return;
+          if (baseScore < MIN_MOMENTUM_SCORE) return;
 
           runnerCandidates++;
 
           let type = "RUNNER";
           if (breakout) type = "PM_BREAKOUT";
-          if (effectiveFloat < LOW_FLOAT_THRESHOLD && c.pct >= 15 && rvol >= 8)
+          if (effectiveFloat < LOW_FLOAT_THRESHOLD && c.pct >= 15 && rvol >= 8) {
             type = "LOW_FLOAT_SQUEEZE";
+          }
 
           const key = `${ticker}:${type}`;
           if (inCooldown(key)) return;
@@ -730,18 +1270,18 @@ async function scan() {
           scoredAlerts.push({
             ticker, price: c.price,
             percent_change: Number(c.pct.toFixed(2)),
-            rvol:           Number(rvol.toFixed(2)),
-            float:          Math.round(effectiveFloat),
-            news:           Boolean(newsOk),
-            alert_type:     type,
-            score:          baseScore,
+            rvol: Number(rvol.toFixed(2)),
+            float: Math.round(effectiveFloat),
+            news: Boolean(newsOk),
+            alert_type: type,
+            score: baseScore,
             meta: JSON.stringify({
-              score:             Number(baseScore.toFixed(2)),
-              volumeAccel:       Number(volumeAccel.toFixed(2)),
-              volumeTrend:       Number(volumeTrend.toFixed(2)),
+              score: Number(baseScore.toFixed(2)),
+              volumeAccel: Number(volumeAccel.toFixed(2)),
+              volumeTrend: Number(volumeTrend.toFixed(2)),
               breakout,
-              pmHigh:            Number(pmHigh.toFixed(2)),
-              trueFloat:         Math.round(trueFloat),
+              pmHigh: Number(pmHigh.toFixed(2)),
+              trueFloat: Math.round(trueFloat),
               sharesOutstanding: Math.round(sharesOut),
             }),
             cooldownKey: key,
@@ -753,11 +1293,11 @@ async function scan() {
         if (PREMARKET_ENABLED && c.pct >= PREMARKET_MIN_GAP) {
           const gapBreakout = pmHigh > 0 && c.price >= pmHigh;
 
-          if (totalVol    < PREMARKET_MIN_VOL)       return;
-          if (rvol        < GAPPER_MIN_RVOL)         return;
-          if (volumeTrend < MIN_VOLUME_TREND)        return;
+          if (totalVol < PREMARKET_MIN_VOL) return;
+          if (rvol < GAPPER_MIN_RVOL) return;
+          if (volumeTrend < MIN_VOLUME_TREND) return;
           if (PREMARKET_REQUIRE_SPIKE && spikeMultiplier < VOLUME_SPIKE_MULTIPLIER) return;
-          if (PREMARKET_REQUIRE_NEWS  && !newsOk)    return;
+          if (PREMARKET_REQUIRE_NEWS && !newsOk) return;
 
           const score = computeMomentumScore({
             pct: c.pct, rvol, volumeAccel: spikeMultiplier, volumeTrend,
@@ -774,20 +1314,20 @@ async function scan() {
           scoredAlerts.push({
             ticker, price: c.price,
             percent_change: Number(c.pct.toFixed(2)),
-            rvol:           Number(rvol.toFixed(2)),
-            float:          Math.round(effectiveFloat),
-            news:           Boolean(newsOk),
-            alert_type:     "GAPPER",
+            rvol: Number(rvol.toFixed(2)),
+            float: Math.round(effectiveFloat),
+            news: Boolean(newsOk),
+            alert_type: "GAPPER",
             score,
             meta: JSON.stringify({
-              score:                Number(score.toFixed(2)),
+              score: Number(score.toFixed(2)),
               premarket_vol_window: Math.round(totalVol),
-              volume_spike:         Number(spikeMultiplier.toFixed(2)),
-              volumeTrend:          Number(volumeTrend.toFixed(2)),
-              breakout:             gapBreakout,
-              pmHigh:               Number(pmHigh || 0),
-              trueFloat:            Math.round(trueFloat),
-              sharesOutstanding:    Math.round(sharesOut),
+              volume_spike: Number(spikeMultiplier.toFixed(2)),
+              volumeTrend: Number(volumeTrend.toFixed(2)),
+              breakout: gapBreakout,
+              pmHigh: Number(pmHigh || 0),
+              trueFloat: Math.round(trueFloat),
+              sharesOutstanding: Math.round(sharesOut),
             }),
             cooldownKey: key,
           });
@@ -800,7 +1340,6 @@ async function scan() {
       }
     });
 
-    // Top N only
     scoredAlerts.sort((a, b) => b.score - a.score);
     const topAlerts = scoredAlerts.slice(0, TOP_ALERTS_PER_SCAN);
 
@@ -820,7 +1359,7 @@ async function scan() {
   } finally {
     lastScanFinishedAt = new Date().toISOString();
     lastScanDurationMs = Date.now() - started;
-    isScanning         = false;
+    isScanning = false;
     _scanStats = {
       tickersFetched, candidatesFound,
       runnerCandidates, gapperCandidates,
@@ -833,8 +1372,18 @@ async function scan() {
 // ===== START =====
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server on port ${PORT} | Telegram: ${Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID)} | Base44: ${Boolean(BASE44_INGEST_URL && BASE44_API_KEY)}`);
+  console.log(
+    `Server on port ${PORT} | ` +
+    `Telegram: ${Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID)} | ` +
+    `Base44: ${Boolean(BASE44_INGEST_URL && BASE44_API_KEY)} | ` +
+    `TOP20: ${TOP20_ENABLED}`
+  );
 });
 
+// Existing scanner
 scan();
 setInterval(scan, SCAN_INTERVAL_MS);
+
+// New Top-20 Technical scanner
+scanTop20Technicals();
+setInterval(scanTop20Technicals, TOP20_SCAN_INTERVAL_MS);
