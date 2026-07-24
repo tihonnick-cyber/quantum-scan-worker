@@ -81,6 +81,9 @@ const TOP20_BAR_LOOKBACK_MIN   = Number(process.env.TOP20_BAR_LOOKBACK_MIN   || 
 const TOP20_HISTORY_CALENDAR_DAYS = Number(process.env.TOP20_HISTORY_CALENDAR_DAYS || 7);
 const TOP20_MIN_BARS           = Number(process.env.TOP20_MIN_BARS           || 110);
 const TOP20_REQUIRE_HIGHER_CLOSES = process.env.TOP20_REQUIRE_HIGHER_CLOSES !== "false";
+const TOP20_QUALITY_ENABLED       = process.env.TOP20_QUALITY_ENABLED !== "false";
+const TOP20_QUALITY_STRONG        = Number(process.env.TOP20_QUALITY_STRONG || 75);
+const TOP20_QUALITY_CAUTION       = Number(process.env.TOP20_QUALITY_CAUTION || 55);
 
 // ===== DB =====
 const pool = new Pool({
@@ -431,6 +434,13 @@ function formatTop20Telegram(result) {
     ? `⚡ <b>BONUS:</b> Fresh 10/100 SMA crossover ${crossBarsAgo === 0 ? "now" : `${crossBarsAgo}m ago`}\n`
     : `➖ Bonus: No fresh 10/100 crossover in last ${TOP20_CROSS_LOOKBACK}m\n`;
 
+  const q = result.momentumQuality || {};
+  const qualityIcon = q.label === "STRONG" ? "🟢" : q.label === "GOOD" ? "🔵" : q.label === "CAUTION" ? "🟡" : "🔴";
+  const qualityLine = `${qualityIcon} Momentum Quality: <b>${Math.round(q.score || 0)}/100 ${q.label || "UNAVAILABLE"}</b>\n`;
+  const riskLine = Array.isArray(q.riskFlags) && q.riskFlags.length
+    ? `⚠️ Risk: ${q.riskFlags.join(", ").replaceAll("_", " ")}\n`
+    : `✅ Risk checks: Clean\n`;
+
   return (
     `${title}\n` +
     `<b>${ticker}</b>  $${Number(price).toFixed(2)}  (<b>${Number(pct).toFixed(2)}%</b>)\n` +
@@ -442,7 +452,8 @@ function formatTop20Telegram(result) {
     `${criteria.volume ? "✅" : "❌"} Volume ≥ ${TOP20_MIN_VOLUME.toLocaleString()}\n` +
     `${criteria.threeGreen ? "✅" : "❌"} 3 Green 1m Candles + Bullish Progression\n` +
     `${criteria.sma100Up ? "✅" : "❌"} 100 SMA Trending Up (${Number(sma100SlopePct).toFixed(3)}%)\n\n` +
-    `${bonusLine}\n` +
+    `${bonusLine}` +
+    `${qualityLine}${riskLine}\n` +
     `SMA10: ${Number(sma10).toFixed(3)}   SMA100: ${Number(sma100).toFixed(3)}\n` +
     (score >= 5
       ? (bonus?.freshSmaCross
@@ -752,7 +763,7 @@ async function runWithConcurrency(items, limit, workerFn) {
     while (idx < items.length) {
       const i = idx++;
       results[i] = await workerFn(items[i], i);
-    }
+        }
   }
 
   await Promise.all(Array.from({ length: Math.max(1, limit) }, runner));
@@ -943,10 +954,19 @@ function computeMacd(values, fastPeriod = 12, slowPeriod = 26, signalPeriod = 9)
   const last = values.length - 1;
   if (macd[last] == null || signal[last] == null) return null;
 
+  const histogram = macd[last] - signal[last];
+  const prevIndex = Math.max(0, last - 3);
+  const previousHistogram =
+    macd[prevIndex] != null && signal[prevIndex] != null
+      ? macd[prevIndex] - signal[prevIndex]
+      : histogram;
+
   return {
     macd: macd[last],
     signal: signal[last],
-    histogram: macd[last] - signal[last],
+    histogram,
+    previousHistogram,
+    strengthening: histogram > previousHistogram,
   };
 }
 
@@ -1006,6 +1026,105 @@ function evaluateThreeGreenBullish(bars) {
   return a.c < b.c && b.c < c.c;
 }
 
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function computeTop20MomentumQuality({ leader, bars, macd, sma10, sma100, sma100Up }) {
+  if (!TOP20_QUALITY_ENABLED || !bars?.length || !sma10 || !sma100) {
+    return { score: 0, label: "UNAVAILABLE", riskFlags: [], metrics: {} };
+  }
+
+  const last = bars[bars.length - 1];
+  const price = Number(leader.price || last.c || 0);
+
+  let trendScore = 0;
+  if (sma10 > sma100) trendScore += 10;
+  if (sma100Up) trendScore += 10;
+
+  let macdScore = 0;
+  if (macd?.macd > macd?.signal && macd?.histogram > 0) macdScore += 10;
+  if (macd?.strengthening) macdScore += 10;
+
+  const recent3 = bars.slice(-3);
+  const prior10 = bars.slice(-13, -3);
+  const recent3Avg = recent3.length ? recent3.reduce((s, b) => s + b.v, 0) / recent3.length : 0;
+  const prior10Avg = prior10.length ? prior10.reduce((s, b) => s + b.v, 0) / prior10.length : 0;
+  const volumeAcceleration = prior10Avg > 0 ? recent3Avg / prior10Avg : 1;
+
+  const volumeScore =
+    volumeAcceleration >= 1.5 ? 20 :
+    volumeAcceleration >= 1.0 ? 12 :
+    volumeAcceleration >= 0.7 ? 5 : 0;
+
+  const distanceAboveSma10Pct = sma10 > 0 ? ((price - sma10) / sma10) * 100 : 0;
+  let extensionScore =
+    distanceAboveSma10Pct <= 1 ? 15 :
+    distanceAboveSma10Pct <= 3 ? 12 :
+    distanceAboveSma10Pct <= 6 ? 7 :
+    distanceAboveSma10Pct <= 10 ? 2 : 0;
+  if (price < sma10) extensionScore = 3;
+
+  const prior20 = bars.slice(-21, -1);
+  const recentHigh = prior20.length ? Math.max(...prior20.map(b => b.h)) : last.h;
+  const highRatio = recentHigh > 0 ? price / recentHigh : 0;
+  const breakoutScore =
+    highRatio >= 1.0 ? 10 :
+    highRatio >= 0.995 ? 8 :
+    highRatio >= 0.98 ? 5 : 0;
+
+  const last5 = bars.slice(-5);
+  const totalVol5 = last5.reduce((s, b) => s + b.v, 0);
+  const redVol5 = last5.filter(b => b.c < b.o).reduce((s, b) => s + b.v, 0);
+  const redVolumeRatio = totalVol5 > 0 ? redVol5 / totalVol5 : 0;
+
+  const sellingPressureScore =
+    redVolumeRatio <= 0.35 ? 10 :
+    redVolumeRatio <= 0.50 ? 7 :
+    redVolumeRatio <= 0.65 ? 3 : 0;
+
+  const recentForReclaim = bars.slice(-5);
+  const hadPullback = recentForReclaim.slice(0, -1).some(b => b.l <= sma10);
+  const reclaim = hadPullback && last.c > sma10 && last.c > last.o;
+  const reclaimScore = reclaim ? 5 : 0;
+
+  const score = Math.round(clamp(
+    trendScore + macdScore + volumeScore + extensionScore +
+    breakoutScore + sellingPressureScore + reclaimScore,
+    0, 100
+  ));
+
+  const riskFlags = [];
+  if (distanceAboveSma10Pct > 6) riskFlags.push("EXTENDED_FROM_10SMA");
+  if (volumeAcceleration < 0.7) riskFlags.push("VOLUME_FADING");
+  if (macd && !macd.strengthening) riskFlags.push("MACD_WEAKENING");
+  if (redVolumeRatio > 0.65) riskFlags.push("HEAVY_RED_VOLUME");
+  if (Number(leader.pct || 0) >= 80) riskFlags.push("DAY_MOVE_EXTENDED");
+  if (price < sma10) riskFlags.push("BELOW_10SMA");
+
+  const label =
+    score >= TOP20_QUALITY_STRONG ? "STRONG" :
+    score >= TOP20_QUALITY_CAUTION ? "GOOD" :
+    score >= 40 ? "CAUTION" : "WEAK";
+
+  return {
+    score,
+    label,
+    riskFlags,
+    metrics: {
+      volumeAcceleration: Number(volumeAcceleration.toFixed(3)),
+      distanceAboveSma10Pct: Number(distanceAboveSma10Pct.toFixed(3)),
+      redVolumeRatio: Number(redVolumeRatio.toFixed(3)),
+      recentHigh: Number(recentHigh.toFixed(4)),
+      nearRecentHigh: highRatio >= 0.98,
+      breakout: highRatio >= 1.0,
+      reclaim10Sma: reclaim,
+      macdStrengthening: Boolean(macd?.strengthening),
+    },
+  };
+}
+
 function evaluateTop20Technical(leader, bars) {
   if (!bars || bars.length < TOP20_MIN_BARS) {
     return {
@@ -1054,11 +1173,21 @@ function evaluateTop20Technical(leader, bars) {
 
   const score = Object.values(criteria).filter(Boolean).length;
 
+  const momentumQuality = computeTop20MomentumQuality({
+    leader,
+    bars,
+    macd,
+    sma10: currentSma10,
+    sma100: currentSma100,
+    sma100Up: criteria.sma100Up,
+  });
+
   return {
     ...leader,
     score,
     criteria,
     bonus,
+    momentumQuality,
     macdLine: macd?.macd ?? 0,
     macdSignal: macd?.signal ?? 0,
     macdHistogram: macd?.histogram ?? 0,
@@ -1093,6 +1222,18 @@ function serializeTop20Result(result) {
     // Fresh crossover is a BONUS, not part of the 5-point score.
     freshCross: Boolean(b.freshSmaCross),
     crossMinutesAgo: result.crossBarsAgo != null ? Number(result.crossBarsAgo) : null,
+
+    momentumQuality: Number(result.momentumQuality?.score || 0),
+    momentumQualityLabel: String(result.momentumQuality?.label || "UNAVAILABLE"),
+    riskFlags: Array.isArray(result.momentumQuality?.riskFlags) ? result.momentumQuality.riskFlags : [],
+    volumeAcceleration: Number(result.momentumQuality?.metrics?.volumeAcceleration || 0),
+    distanceAboveSma10Pct: Number(result.momentumQuality?.metrics?.distanceAboveSma10Pct || 0),
+    redVolumeRatio: Number(result.momentumQuality?.metrics?.redVolumeRatio || 0),
+    recentHigh: Number(result.momentumQuality?.metrics?.recentHigh || 0),
+    nearRecentHigh: Boolean(result.momentumQuality?.metrics?.nearRecentHigh),
+    breakingRecentHigh: Boolean(result.momentumQuality?.metrics?.breakout),
+    reclaim10Sma: Boolean(result.momentumQuality?.metrics?.reclaim10Sma),
+    macdStrengthening: Boolean(result.momentumQuality?.metrics?.macdStrengthening),
 
     // Extra values for detail cards / troubleshooting.
     sma10: Number(Number(result.sma10 || 0).toFixed(4)),
@@ -1448,7 +1589,7 @@ async function scan() {
           return;
         }
 
-       // ── GAPPER ───────────────────────────────────────────────────
+        // ── GAPPER ───────────────────────────────────────────────────
         if (PREMARKET_ENABLED && c.pct >= PREMARKET_MIN_GAP) {
           const gapBreakout = pmHigh > 0 && c.price >= pmHigh;
 
