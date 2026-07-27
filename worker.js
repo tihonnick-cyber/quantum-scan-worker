@@ -85,6 +85,20 @@ const TOP20_QUALITY_ENABLED       = process.env.TOP20_QUALITY_ENABLED !== "false
 const TOP20_QUALITY_STRONG        = Number(process.env.TOP20_QUALITY_STRONG || 75);
 const TOP20_QUALITY_CAUTION       = Number(process.env.TOP20_QUALITY_CAUTION || 55);
 
+// ===== TOP-20 MOMENTUM SAFETY FILTER =====
+// These filters do NOT change the 5 core criteria. They decide whether a
+// qualifying 4/5 or 5/5 setup is safe enough to send to Telegram.
+const TOP20_SAFETY_FILTER_ENABLED       = process.env.TOP20_SAFETY_FILTER_ENABLED !== "false";
+const TOP20_REQUIRE_PRICE_ABOVE_SMA10   = process.env.TOP20_REQUIRE_PRICE_ABOVE_SMA10 !== "false";
+const TOP20_REQUIRE_SMA10_RISING        = process.env.TOP20_REQUIRE_SMA10_RISING !== "false";
+const TOP20_SMA10_TREND_LOOKBACK        = Number(process.env.TOP20_SMA10_TREND_LOOKBACK || 3);
+const TOP20_MAX_RED_VOLUME_RATIO        = Number(process.env.TOP20_MAX_RED_VOLUME_RATIO || 0.65);
+const TOP20_RECENT_MOMENTUM_LOOKBACK    = Number(process.env.TOP20_RECENT_MOMENTUM_LOOKBACK || 3);
+const TOP20_MIN_RECENT_MOMENTUM_PCT     = Number(process.env.TOP20_MIN_RECENT_MOMENTUM_PCT || 0);
+const TOP20_MAX_UPPER_WICK_RATIO        = Number(process.env.TOP20_MAX_UPPER_WICK_RATIO || 0.55);
+const TOP20_MAX_DISTANCE_ABOVE_SMA10_PCT = Number(process.env.TOP20_MAX_DISTANCE_ABOVE_SMA10_PCT || 8);
+const TOP20_REQUIRE_MACD_STRENGTHENING  = process.env.TOP20_REQUIRE_MACD_STRENGTHENING === "true";
+
 // ===== DB =====
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -130,7 +144,6 @@ let top20AlertsSent         = 0;
 let top20LastLeaders        = [];
 let top20LastResults        = [];
 let top20LastStats          = {};
-
 // ===== ROUTES =====
 app.get("/", (_req, res) => res.send("Quantum Scan Worker is running"));
 
@@ -195,6 +208,19 @@ app.get("/health", async (_req, res) => {
           TOP20_HISTORY_CALENDAR_DAYS,
           TOP20_MIN_BARS,
           TOP20_REQUIRE_HIGHER_CLOSES,
+          TOP20_QUALITY_ENABLED,
+          TOP20_QUALITY_STRONG,
+          TOP20_QUALITY_CAUTION,
+          TOP20_SAFETY_FILTER_ENABLED,
+          TOP20_REQUIRE_PRICE_ABOVE_SMA10,
+          TOP20_REQUIRE_SMA10_RISING,
+          TOP20_SMA10_TREND_LOOKBACK,
+          TOP20_MAX_RED_VOLUME_RATIO,
+          TOP20_RECENT_MOMENTUM_LOOKBACK,
+          TOP20_MIN_RECENT_MOMENTUM_PCT,
+          TOP20_MAX_UPPER_WICK_RATIO,
+          TOP20_MAX_DISTANCE_ABOVE_SMA10_PCT,
+          TOP20_REQUIRE_MACD_STRENGTHENING,
         },
       },
     });
@@ -419,7 +445,7 @@ function formatEarlyTelegram({ ticker, price, pct, rvol, float, volumeAccel, vol
   );
 }
 
-function formatTop20Telegram(result) {
+function formatTop20Telegram(result, timing = {}) {
   const {
     ticker, rank, price, pct, volume, score, criteria, bonus,
     macdLine, macdSignal, sma10, sma100, crossBarsAgo, sma100SlopePct,
@@ -435,11 +461,32 @@ function formatTop20Telegram(result) {
     : `➖ Bonus: No fresh 10/100 crossover in last ${TOP20_CROSS_LOOKBACK}m\n`;
 
   const q = result.momentumQuality || {};
-  const qualityIcon = q.label === "STRONG" ? "🟢" : q.label === "GOOD" ? "🔵" : q.label === "CAUTION" ? "🟡" : "🔴";
-  const qualityLine = `${qualityIcon} Momentum Quality: <b>${Math.round(q.score || 0)}/100 ${q.label || "UNAVAILABLE"}</b>\n`;
+  const qualityIcon =
+    q.label === "STRONG" ? "🟢" :
+    q.label === "GOOD" ? "🔵" :
+    q.label === "CAUTION" ? "🟡" : "🔴";
+
+  const qualityLine =
+    `${qualityIcon} Momentum Quality: <b>${Math.round(q.score || 0)}/100 ${q.label || "UNAVAILABLE"}</b>\n`;
+
   const riskLine = Array.isArray(q.riskFlags) && q.riskFlags.length
     ? `⚠️ Risk: ${q.riskFlags.join(", ").replaceAll("_", " ")}\n`
     : `✅ Risk checks: Clean\n`;
+
+  const safety = result.safety || {};
+  const safetyLine = safety.passed
+    ? `🛡️ Safety Filter: <b>PASS</b>\n`
+    : `🛑 Safety Filter: <b>BLOCKED</b> — ${(safety.reasons || []).join(", ").replaceAll("_", " ")}\n`;
+
+  const detectedAtMs = Number(result.detectedAtMs || timing.detectedAtMs || Date.now());
+  const scanStartedAtMs = Number(timing.scanStartedAtMs || detectedAtMs);
+  const signalLatencyMs = Math.max(0, detectedAtMs - scanStartedAtMs);
+  const dataBarMs = Number(result.lastCompletedBarAtMs || 0);
+
+  const timingLines =
+    `⏱ Detected: ${formatPacificTime(detectedAtMs)} PT\n` +
+    `⚙️ Scan-to-signal: ${signalLatencyMs} ms\n` +
+    (dataBarMs ? `🕯 Latest completed 1m bar: ${formatPacificTime(dataBarMs)} PT\n` : "");
 
   return (
     `${title}\n` +
@@ -453,7 +500,7 @@ function formatTop20Telegram(result) {
     `${criteria.threeGreen ? "✅" : "❌"} 3 Green 1m Candles + Bullish Progression\n` +
     `${criteria.sma100Up ? "✅" : "❌"} 100 SMA Trending Up (${Number(sma100SlopePct).toFixed(3)}%)\n\n` +
     `${bonusLine}` +
-    `${qualityLine}${riskLine}\n` +
+    `${qualityLine}${riskLine}${safetyLine}\n` +
     `SMA10: ${Number(sma10).toFixed(3)}   SMA100: ${Number(sma100).toFixed(3)}\n` +
     (score >= 5
       ? (bonus?.freshSmaCross
@@ -462,6 +509,7 @@ function formatTop20Telegram(result) {
       : (bonus?.freshSmaCross
           ? `Setup Score: <b>${score}/5 + ⚡ crossover bonus</b>\n`
           : `Setup Score: <b>${score}/5</b>\n`)) +
+    `${timingLines}` +
     `<a href="${tv}">Chart →</a>`
   );
 }
@@ -473,7 +521,6 @@ const cache = {
   news:       new Map(),
   minuteAggs: new Map(),
 };
-
 function getCache(map, key) {
   const entry = map.get(key);
   if (!entry) return null;
@@ -496,6 +543,17 @@ function pacificHourNow() {
     hour12: false,
   }).formatToParts(new Date());
   return Number(parts.find(p => p.type === "hour")?.value || 0);
+}
+
+function formatPacificTime(msOrDate = Date.now()) {
+  const d = msOrDate instanceof Date ? msOrDate : new Date(msOrDate);
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  }).format(d);
 }
 
 // ===== POLYGON (EXISTING SCANNER) =====
@@ -546,7 +604,6 @@ async function fetchAllSnapshotTickers() {
 
   return all;
 }
-
 function computePercentChange(t) {
   const prevClose = Number(t?.prevDay?.c || 0);
   if (prevClose <= 0) return 0;
@@ -567,7 +624,6 @@ async function getAvgDailyVolume(ticker, prevDayVol = 0) {
   const lookbackCalendarDays = Math.max(AVG_VOL_DAYS * 2, 40);
   const to   = new Date().toISOString().slice(0, 10);
   const from = new Date(Date.now() - lookbackCalendarDays * 86_400_000).toISOString().slice(0, 10);
-
   const url =
     `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}` +
     `/range/1/day/${from}/${to}?adjusted=true&sort=desc&limit=50000&apiKey=${POLYGON_KEY}`;
@@ -630,7 +686,6 @@ async function hasRecentNews(ticker, lookbackMin) {
     const data = await polygonJson(url);
     ok = Array.isArray(data?.results) && data.results.length > 0;
   } catch { ok = false; }
-
   setCache(cache.news, key, ok, 2 * 60_000);
   return ok;
 }
@@ -763,13 +818,12 @@ async function runWithConcurrency(items, limit, workerFn) {
     while (idx < items.length) {
       const i = idx++;
       results[i] = await workerFn(items[i], i);
-        }
+    }
   }
 
   await Promise.all(Array.from({ length: Math.max(1, limit) }, runner));
   return results;
-}
-
+  }
 // ============================================================================
 // NEW TOP-20 TECHNICAL SCANNER (MASSIVE -> RAILWAY -> TELEGRAM ONLY)
 // ============================================================================
@@ -811,7 +865,6 @@ async function massiveJson(pathOrUrl, attempt = 0) {
 
   return resp.json();
 }
-
 async function fetchTop20Gainers() {
   const data = await massiveJson(
     "/v2/snapshot/locale/us/markets/stocks/gainers"
@@ -895,7 +948,6 @@ async function getTop20MinuteBars(ticker) {
   );
   const barsToKeep = Math.max(minimumNeeded + 100, 250);
   if (bars.length > barsToKeep) bars = bars.slice(-barsToKeep);
-
   // Remove older cache keys for this ticker so memory stays small.
   for (const key of top20TechnicalBarCache.keys()) {
     if (key.startsWith(`${ticker}:`) && key !== cacheKey) {
@@ -937,7 +989,6 @@ function computeMacd(values, fastPeriod = 12, slowPeriod = 26, signalPeriod = 9)
   const macd = values.map((_, i) =>
     fast[i] != null && slow[i] != null ? fast[i] - slow[i] : null
   );
-
   const validMacd = macd.filter(v => v != null);
   if (validMacd.length < signalPeriod) return null;
 
@@ -1021,7 +1072,6 @@ function evaluateThreeGreenBullish(bars) {
   if (!allGreen) return false;
 
   if (!TOP20_REQUIRE_HIGHER_CLOSES) return true;
-
   // Bullish progression: each green candle closes higher than the prior candle.
   return a.c < b.c && b.c < c.c;
 }
@@ -1042,15 +1092,16 @@ function computeTop20MomentumQuality({ leader, bars, macd, sma10, sma100, sma100
   let trendScore = 0;
   if (sma10 > sma100) trendScore += 10;
   if (sma100Up) trendScore += 10;
-
   let macdScore = 0;
   if (macd?.macd > macd?.signal && macd?.histogram > 0) macdScore += 10;
   if (macd?.strengthening) macdScore += 10;
 
   const recent3 = bars.slice(-3);
   const prior10 = bars.slice(-13, -3);
-  const recent3Avg = recent3.length ? recent3.reduce((s, b) => s + b.v, 0) / recent3.length : 0;
-  const prior10Avg = prior10.length ? prior10.reduce((s, b) => s + b.v, 0) / prior10.length : 0;
+  const recent3Avg = recent3.length
+    ? recent3.reduce((s, b) => s + b.v, 0) / recent3.length : 0;
+  const prior10Avg = prior10.length
+    ? prior10.reduce((s, b) => s + b.v, 0) / prior10.length : 0;
   const volumeAcceleration = prior10Avg > 0 ? recent3Avg / prior10Avg : 1;
 
   const volumeScore =
@@ -1076,7 +1127,9 @@ function computeTop20MomentumQuality({ leader, bars, macd, sma10, sma100, sma100
 
   const last5 = bars.slice(-5);
   const totalVol5 = last5.reduce((s, b) => s + b.v, 0);
-  const redVol5 = last5.filter(b => b.c < b.o).reduce((s, b) => s + b.v, 0);
+  const redVol5 = last5
+    .filter(b => b.c < b.o)
+    .reduce((s, b) => s + b.v, 0);
   const redVolumeRatio = totalVol5 > 0 ? redVol5 / totalVol5 : 0;
 
   const sellingPressureScore =
@@ -1089,12 +1142,6 @@ function computeTop20MomentumQuality({ leader, bars, macd, sma10, sma100, sma100
   const reclaim = hadPullback && last.c > sma10 && last.c > last.o;
   const reclaimScore = reclaim ? 5 : 0;
 
-  const score = Math.round(clamp(
-    trendScore + macdScore + volumeScore + extensionScore +
-    breakoutScore + sellingPressureScore + reclaimScore,
-    0, 100
-  ));
-
   const riskFlags = [];
   if (distanceAboveSma10Pct > 6) riskFlags.push("EXTENDED_FROM_10SMA");
   if (volumeAcceleration < 0.7) riskFlags.push("VOLUME_FADING");
@@ -1103,13 +1150,39 @@ function computeTop20MomentumQuality({ leader, bars, macd, sma10, sma100, sma100
   if (Number(leader.pct || 0) >= 80) riskFlags.push("DAY_MOVE_EXTENDED");
   if (price < sma10) riskFlags.push("BELOW_10SMA");
 
-  const label =
+  const rawScore =
+    trendScore + macdScore + volumeScore + extensionScore +
+    breakoutScore + sellingPressureScore + reclaimScore;
+
+  // Risk penalties prevent contradictory labels such as
+  // "75/100 STRONG" while also showing HEAVY RED VOLUME.
+  let penalty = 0;
+  if (riskFlags.includes("HEAVY_RED_VOLUME")) penalty += 25;
+  if (riskFlags.includes("BELOW_10SMA")) penalty += 25;
+  if (riskFlags.includes("VOLUME_FADING")) penalty += 15;
+  if (riskFlags.includes("MACD_WEAKENING")) penalty += 10;
+  if (riskFlags.includes("DAY_MOVE_EXTENDED")) penalty += 10;
+  if (riskFlags.includes("EXTENDED_FROM_10SMA")) penalty += 10;
+
+  const score = Math.round(clamp(rawScore - penalty, 0, 100));
+
+  let label =
     score >= TOP20_QUALITY_STRONG ? "STRONG" :
     score >= TOP20_QUALITY_CAUTION ? "GOOD" :
     score >= 40 ? "CAUTION" : "WEAK";
 
+  // Hard-risk conditions can never display as STRONG/GOOD.
+  if (
+    riskFlags.includes("HEAVY_RED_VOLUME") ||
+    riskFlags.includes("BELOW_10SMA")
+  ) {
+    label = score >= 40 ? "CAUTION" : "WEAK";
+  }
+
   return {
     score,
+    rawScore: Math.round(rawScore),
+    penalty,
     label,
     riskFlags,
     metrics: {
@@ -1125,6 +1198,86 @@ function computeTop20MomentumQuality({ leader, bars, macd, sma10, sma100, sma100
   };
 }
 
+function evaluateTop20Safety({ leader, bars, macd, sma10, momentumQuality }) {
+  if (!TOP20_SAFETY_FILTER_ENABLED) {
+    return {
+      passed: true,
+      reasons: [],
+      metrics: {},
+    };
+  }
+
+  const last = bars[bars.length - 1];
+  const closes = bars.map(b => b.c);
+  const price = Number(leader.price || last.c || 0);
+
+  const sma10PastEnd = closes.length - TOP20_SMA10_TREND_LOOKBACK;
+  const pastSma10 = sma(closes, 10, sma10PastEnd);
+  const sma10SlopePct =
+    sma10 != null && pastSma10 != null && pastSma10 !== 0
+      ? ((sma10 - pastSma10) / pastSma10) * 100
+      : 0;
+  const momentumLookback = Math.max(1, TOP20_RECENT_MOMENTUM_LOOKBACK);
+  const oldIndex = Math.max(0, closes.length - 1 - momentumLookback);
+  const oldClose = closes[oldIndex] || price;
+  const recentMomentumPct =
+    oldClose > 0 ? ((last.c - oldClose) / oldClose) * 100 : 0;
+
+  const last3 = bars.slice(-3);
+  const upperWickRatios = last3.map(b => {
+    const range = Math.max(0, b.h - b.l);
+    if (range <= 0) return 0;
+    const upperWick = Math.max(0, b.h - Math.max(b.o, b.c));
+    return upperWick / range;
+  });
+  const avgUpperWickRatio = upperWickRatios.length
+    ? upperWickRatios.reduce((a, b) => a + b, 0) / upperWickRatios.length
+    : 0;
+
+  const q = momentumQuality?.metrics || {};
+  const redVolumeRatio = Number(q.redVolumeRatio || 0);
+  const distanceAboveSma10Pct = Number(q.distanceAboveSma10Pct || 0);
+  const reasons = [];
+
+  if (TOP20_REQUIRE_PRICE_ABOVE_SMA10 && !(price > sma10)) {
+    reasons.push("PRICE_BELOW_10SMA");
+  }
+
+  if (TOP20_REQUIRE_SMA10_RISING && !(sma10SlopePct > 0)) {
+    reasons.push("SMA10_NOT_RISING");
+  }
+
+  if (redVolumeRatio > TOP20_MAX_RED_VOLUME_RATIO) {
+    reasons.push("HEAVY_RED_VOLUME");
+  }
+
+  if (recentMomentumPct < TOP20_MIN_RECENT_MOMENTUM_PCT) {
+    reasons.push("RECENT_MOMENTUM_WEAK");
+  }
+
+  if (avgUpperWickRatio > TOP20_MAX_UPPER_WICK_RATIO) {
+    reasons.push("REJECTION_WICKS");
+  }
+
+  if (distanceAboveSma10Pct > TOP20_MAX_DISTANCE_ABOVE_SMA10_PCT) {
+    reasons.push("TOO_EXTENDED_FROM_10SMA");
+  }
+
+  if (TOP20_REQUIRE_MACD_STRENGTHENING && !macd?.strengthening) {
+    reasons.push("MACD_NOT_STRENGTHENING");
+  }
+
+  return {
+    passed: reasons.length === 0,
+    reasons,
+    metrics: {
+      priceAboveSma10: price > sma10,
+      sma10SlopePct: Number(sma10SlopePct.toFixed(4)),
+      recentMomentumPct: Number(recentMomentumPct.toFixed(4)),
+      avgUpperWickRatio: Number(avgUpperWickRatio.toFixed(4)),
+    },
+  };
+}
 function evaluateTop20Technical(leader, bars) {
   if (!bars || bars.length < TOP20_MIN_BARS) {
     return {
@@ -1166,7 +1319,6 @@ function evaluateTop20Technical(leader, bars) {
       currentSma100 > pastSma100
     ),
   };
-
   const bonus = {
     freshSmaCross: Boolean(cross.passed),
   };
@@ -1182,12 +1334,26 @@ function evaluateTop20Technical(leader, bars) {
     sma100Up: criteria.sma100Up,
   });
 
+  const safety = evaluateTop20Safety({
+    leader,
+    bars,
+    macd,
+    sma10: currentSma10,
+    momentumQuality,
+  });
+
+  const detectedAtMs = Date.now();
+  const lastCompletedBarAtMs = bars[bars.length - 1]?.t || 0;
+
   return {
     ...leader,
     score,
     criteria,
     bonus,
     momentumQuality,
+    safety,
+    detectedAtMs,
+    lastCompletedBarAtMs,
     macdLine: macd?.macd ?? 0,
     macdSignal: macd?.signal ?? 0,
     macdHistogram: macd?.histogram ?? 0,
@@ -1235,6 +1401,19 @@ function serializeTop20Result(result) {
     reclaim10Sma: Boolean(result.momentumQuality?.metrics?.reclaim10Sma),
     macdStrengthening: Boolean(result.momentumQuality?.metrics?.macdStrengthening),
 
+    // Momentum safety filter state.
+    safetyPass: Boolean(result.safety?.passed),
+    safetyReasons: Array.isArray(result.safety?.reasons) ? result.safety.reasons : [],
+    priceAboveSma10: Boolean(result.safety?.metrics?.priceAboveSma10),
+    sma10SlopePct: Number(result.safety?.metrics?.sma10SlopePct || 0),
+    recentMomentumPct: Number(result.safety?.metrics?.recentMomentumPct || 0),
+    avgUpperWickRatio: Number(result.safety?.metrics?.avgUpperWickRatio || 0),
+
+    // Timing fields so Base44 can show exactly how fresh the signal is.
+    detectedAt: result.detectedAtMs ? new Date(result.detectedAtMs).toISOString() : null,
+    lastCompletedBarAt: result.lastCompletedBarAtMs
+      ? new Date(result.lastCompletedBarAtMs).toISOString() : null,
+
     // Extra values for detail cards / troubleshooting.
     sma10: Number(Number(result.sma10 || 0).toFixed(4)),
     sma100: Number(Number(result.sma100 || 0).toFixed(4)),
@@ -1263,8 +1442,9 @@ function shouldSendTop20Alert(result) {
   };
 
   const score = result.score;
-
-  if (score < TOP20_MIN_SCORE) {
+  const safetyPass = result.safety?.passed !== false;
+  const qualifiesForAlert = score >= TOP20_MIN_SCORE && safetyPass;
+  if (!qualifiesForAlert) {
     if (!state.belowThresholdSince) state.belowThresholdSince = now;
 
     // Rearm after it has been below the qualifying threshold for the configured time.
@@ -1381,17 +1561,31 @@ async function scanTop20Technicals() {
       if (result.score === 4) qualifying4++;
       if (result.score === 5) qualifying5++;
 
-      if (result.score >= TOP20_MIN_SCORE && shouldSendTop20Alert(result)) {
-        await pushToTelegram(formatTop20Telegram(result));
+      const shouldAlert = shouldSendTop20Alert(result);
+
+      if (
+        result.score >= TOP20_MIN_SCORE &&
+        result.safety?.passed &&
+        shouldAlert
+      ) {
+        const telegramStartedAt = Date.now();
+        await pushToTelegram(
+          formatTop20Telegram(result, {
+            scanStartedAtMs: started,
+            detectedAtMs: result.detectedAtMs,
+          })
+        );
+        const telegramApiMs = Date.now() - telegramStartedAt;
+
         alertsThisRun++;
         top20AlertsSent++;
         console.log(
           `[TOP20][ALERT] #${result.rank} ${result.ticker} ` +
-          `score=${result.score}/5 pct=${result.pct.toFixed(2)} vol=${Math.round(result.volume)}`
+          `score=${result.score}/5 quality=${result.momentumQuality?.score || 0}/100 ` +
+          `scanToSignalMs=${Math.max(0, result.detectedAtMs - started)} ` +
+          `telegramApiMs=${telegramApiMs} ` +
+          `pct=${result.pct.toFixed(2)} vol=${Math.round(result.volume)}`
         );
-      } else if (result.score < TOP20_MIN_SCORE) {
-        // Update/rearm state for non-qualifying names.
-        shouldSendTop20Alert(result);
       }
     }
   } catch (e) {
@@ -1417,7 +1611,6 @@ async function scanTop20Technicals() {
 // ============================================================================
 async function scan() {
   lastLoopAt = new Date().toISOString();
-
   // Master switch for the existing Quantum scanner only.
   if (!QUANTUM_ENABLED) {
     return;
