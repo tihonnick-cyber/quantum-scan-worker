@@ -99,6 +99,37 @@ const TOP20_MAX_UPPER_WICK_RATIO        = Number(process.env.TOP20_MAX_UPPER_WIC
 const TOP20_MAX_DISTANCE_ABOVE_SMA10_PCT = Number(process.env.TOP20_MAX_DISTANCE_ABOVE_SMA10_PCT || 8);
 const TOP20_REQUIRE_MACD_STRENGTHENING  = process.env.TOP20_REQUIRE_MACD_STRENGTHENING === "true";
 
+// ===== TOP-20 LEVEL 1 BUY-PRESSURE CONFIRMATION =====
+// This is a bonus/confirmation layer. It does NOT change the core 4/5 or 5/5 score.
+const TOP20_LEVEL1_ENABLED          = process.env.TOP20_LEVEL1_ENABLED !== "false";
+const TOP20_LEVEL1_BULL_RATIO       = Number(process.env.TOP20_LEVEL1_BULL_RATIO || 1.5);
+const TOP20_LEVEL1_BEAR_RATIO       = Number(process.env.TOP20_LEVEL1_BEAR_RATIO || 0.75);
+const TOP20_LEVEL1_MAX_SPREAD_PCT   = Number(process.env.TOP20_LEVEL1_MAX_SPREAD_PCT || 1.0);
+const TOP20_LEVEL1_MAX_QUOTE_AGE_SEC = Number(process.env.TOP20_LEVEL1_MAX_QUOTE_AGE_SEC || 30);
+
+// ===== TOP-20 ONE-MINUTE 5X VOLUME SPIKE =====
+// Measures ONE completed 1-minute candle against the average volume of the
+// preceding completed 1-minute candles. It only passes when the stock is
+// already in a confirmed uptrend.
+const TOP20_1M_SPIKE_ENABLED          = process.env.TOP20_1M_SPIKE_ENABLED !== "false";
+const TOP20_1M_SPIKE_MULTIPLIER       = Number(process.env.TOP20_1M_SPIKE_MULTIPLIER || 5);
+const TOP20_1M_SPIKE_BASELINE_BARS    = Number(process.env.TOP20_1M_SPIKE_BASELINE_BARS || 20);
+const TOP20_1M_SPIKE_COMPLETION_GRACE_MS = Number(process.env.TOP20_1M_SPIKE_COMPLETION_GRACE_MS || 2000);
+const TOP20_REQUIRE_1M_SPIKE_FOR_ALERT = process.env.TOP20_REQUIRE_1M_SPIKE_FOR_ALERT === "true";
+
+
+
+// ===== TOP-20 RELIABILITY / LEARNING LAYER =====
+// Defaults are conservative; all can be tuned later from Railway.
+const TOP20_MAX_BAR_AGE_SEC            = Number(process.env.TOP20_MAX_BAR_AGE_SEC || 150);
+const TOP20_MAX_ZERO_VOL_RATIO         = Number(process.env.TOP20_MAX_ZERO_VOL_RATIO || 0.35);
+const TOP20_CIRCUIT_BREAKER_FAILURES   = Number(process.env.TOP20_CIRCUIT_BREAKER_FAILURES || 3);
+const TOP20_SHADOW_MODE                = process.env.TOP20_SHADOW_MODE !== "false";
+const TOP20_OUTCOME_TRACKING           = process.env.TOP20_OUTCOME_TRACKING !== "false";
+const TOP20_SELF_TEST_ENABLED          = process.env.TOP20_SELF_TEST_ENABLED !== "false";
+const TOP20_SELF_TEST_HOUR_PT          = Number(process.env.TOP20_SELF_TEST_HOUR_PT || 5);
+const TOP20_SELF_TEST_MINUTE_PT        = Number(process.env.TOP20_SELF_TEST_MINUTE_PT || 55);
+
 // ===== DB =====
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -144,6 +175,17 @@ let top20AlertsSent         = 0;
 let top20LastLeaders        = [];
 let top20LastResults        = [];
 let top20LastStats          = {};
+
+let top20FeedFailureCount      = 0;
+let top20CircuitOpen           = false;
+let top20CircuitNotified       = false;
+let top20LastFeedRecoveryAt    = null;
+let top20LastSelfTestDate      = null;
+let top20LastSelfTest          = null;
+let top20ShadowSignals         = 0;
+let top20TrackedSignals        = 0;
+let top20OutcomeUpdates        = 0;
+const top20ShadowState         = new Map();
 // ===== ROUTES =====
 app.get("/", (_req, res) => res.send("Quantum Scan Worker is running"));
 
@@ -195,6 +237,15 @@ app.get("/health", async (_req, res) => {
         lastLeaders: top20LastLeaders,
         latestResultCount: top20LastResults.length,
         lastStats: top20LastStats,
+        reliability: {
+          feedFailureCount: top20FeedFailureCount,
+          circuitOpen: top20CircuitOpen,
+          lastFeedRecoveryAt: top20LastFeedRecoveryAt,
+          lastSelfTest: top20LastSelfTest,
+          shadowSignals: top20ShadowSignals,
+          trackedSignals: top20TrackedSignals,
+          outcomeUpdates: top20OutcomeUpdates,
+        },
         config: {
           TOP20_START_HOUR_PT,
           TOP20_END_HOUR_PT,
@@ -221,6 +272,24 @@ app.get("/health", async (_req, res) => {
           TOP20_MAX_UPPER_WICK_RATIO,
           TOP20_MAX_DISTANCE_ABOVE_SMA10_PCT,
           TOP20_REQUIRE_MACD_STRENGTHENING,
+          TOP20_LEVEL1_ENABLED,
+          TOP20_LEVEL1_BULL_RATIO,
+          TOP20_LEVEL1_BEAR_RATIO,
+          TOP20_LEVEL1_MAX_SPREAD_PCT,
+          TOP20_LEVEL1_MAX_QUOTE_AGE_SEC,
+          TOP20_1M_SPIKE_ENABLED,
+          TOP20_1M_SPIKE_MULTIPLIER,
+          TOP20_1M_SPIKE_BASELINE_BARS,
+          TOP20_1M_SPIKE_COMPLETION_GRACE_MS,
+          TOP20_REQUIRE_1M_SPIKE_FOR_ALERT,
+          TOP20_MAX_BAR_AGE_SEC,
+          TOP20_MAX_ZERO_VOL_RATIO,
+          TOP20_CIRCUIT_BREAKER_FAILURES,
+          TOP20_SHADOW_MODE,
+          TOP20_OUTCOME_TRACKING,
+          TOP20_SELF_TEST_ENABLED,
+          TOP20_SELF_TEST_HOUR_PT,
+          TOP20_SELF_TEST_MINUTE_PT,
         },
       },
     });
@@ -231,6 +300,7 @@ app.get("/health", async (_req, res) => {
 
 function getTop20ScannerStatus() {
   if (!TOP20_ENABLED) return "OFF";
+  if (top20CircuitOpen) return "FEED_PAUSED";
 
   const hour = pacificHourNow();
   if (hour < TOP20_START_HOUR_PT || hour >= TOP20_END_HOUR_PT) {
@@ -241,7 +311,6 @@ function getTop20ScannerStatus() {
   if (top20IsScanning) return "SCANNING";
   return "ACTIVE";
 }
-
 // Latest Top-20 Scalp state for the Base44 visual dashboard.
 // This route only returns data already calculated by Railway; it does NOT trigger a new Massive scan.
 app.get("/top20", (_req, res) => {
@@ -262,9 +331,36 @@ app.get("/top20", (_req, res) => {
       startHour: TOP20_START_HOUR_PT,
       endHour: TOP20_END_HOUR_PT,
     },
+    reliability: {
+      feedFailureCount: top20FeedFailureCount,
+      circuitOpen: top20CircuitOpen,
+      lastFeedRecoveryAt: top20LastFeedRecoveryAt,
+      lastSelfTest: top20LastSelfTest,
+      shadowSignals: top20ShadowSignals,
+      trackedSignals: top20TrackedSignals,
+      outcomeUpdates: top20OutcomeUpdates,
+    },
     count: top20LastResults.length,
     stocks: top20LastResults,
   });
+});
+
+
+app.get("/top20_signals", async (_req, res) => {
+  try {
+    await ensureTop20TrackingTable();
+    const result = await pool.query(`
+      SELECT id, ticker, signal_kind, score, quality_score, price, percent_change,
+             gainer_rank, detected_at, block_reasons,
+             outcome_1m_pct, outcome_3m_pct, outcome_5m_pct, outcome_10m_pct
+      FROM top20_signal_log
+      ORDER BY detected_at DESC
+      LIMIT 200
+    `);
+    res.json({ ok: true, signals: result.rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 app.get("/alerts", async (_req, res) => {
@@ -353,6 +449,154 @@ async function wasAlertedRecently(ticker) {
   return result.rowCount > 0;
 }
 
+
+// ===== TOP-20 SIGNAL LEARNING / OUTCOME DB =====
+let top20TrackingInitPromise = null;
+
+async function ensureTop20TrackingTable() {
+  if (top20TrackingInitPromise) return top20TrackingInitPromise;
+
+  top20TrackingInitPromise = (async () => {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS top20_signal_log (
+        id BIGSERIAL PRIMARY KEY,
+        ticker TEXT NOT NULL,
+        signal_kind TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        quality_score INTEGER,
+        price DOUBLE PRECISION NOT NULL,
+        percent_change DOUBLE PRECISION,
+        gainer_rank INTEGER,
+        detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        block_reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+        snapshot JSONB,
+        outcome_1m_pct DOUBLE PRECISION,
+        outcome_3m_pct DOUBLE PRECISION,
+        outcome_5m_pct DOUBLE PRECISION,
+        outcome_10m_pct DOUBLE PRECISION,
+        outcome_1m_at TIMESTAMPTZ,
+        outcome_3m_at TIMESTAMPTZ,
+        outcome_5m_at TIMESTAMPTZ,
+        outcome_10m_at TIMESTAMPTZ
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_top20_signal_log_pending
+      ON top20_signal_log (detected_at DESC)
+    `);
+  })().catch(err => {
+    top20TrackingInitPromise = null;
+    throw err;
+  });
+
+  return top20TrackingInitPromise;
+}
+
+async function recordTop20Signal(result, kind, reasons = []) {
+  if (!TOP20_OUTCOME_TRACKING) return null;
+  try {
+    await ensureTop20TrackingTable();
+    const snapshot = serializeTop20Result(result);
+    const q = Number(result.momentumQuality?.score || 0);
+    const inserted = await pool.query(
+      `INSERT INTO top20_signal_log
+       (ticker, signal_kind, score, quality_score, price, percent_change, gainer_rank, detected_at, block_reasons, snapshot)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)
+       RETURNING id`,
+      [
+        result.ticker,
+        kind,
+        Number(result.score || 0),
+        q,
+        Number(result.price || 0),
+        Number(result.pct || 0),
+        Number(result.rank || 0),
+        new Date(result.detectedAtMs || Date.now()).toISOString(),
+        JSON.stringify(reasons || []),
+        JSON.stringify(snapshot),
+      ]
+    );
+    top20TrackedSignals++;
+    return inserted.rows[0]?.id || null;
+  } catch (e) {
+    console.error('[TOP20][TRACKING] record error:', e.message);
+    return null;
+  }
+}
+
+async function fetchMassiveTickerPrice(ticker) {
+  const data = await massiveJson(
+    `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(ticker)}`
+  );
+  const t = data?.ticker || {};
+  return Number(t?.lastTrade?.p) || Number(t?.day?.c) || Number(t?.min?.c) || 0;
+}
+
+async function updateTop20Outcomes() {
+  if (!TOP20_OUTCOME_TRACKING || top20CircuitOpen) return;
+  try {
+    await ensureTop20TrackingTable();
+    const pending = await pool.query(`
+      SELECT id, ticker, price, detected_at,
+             outcome_1m_pct, outcome_3m_pct, outcome_5m_pct, outcome_10m_pct
+      FROM top20_signal_log
+      WHERE detected_at >= now() - interval '20 minutes'
+        AND (
+          outcome_1m_pct IS NULL OR outcome_3m_pct IS NULL OR
+          outcome_5m_pct IS NULL OR outcome_10m_pct IS NULL
+        )
+      ORDER BY detected_at ASC
+      LIMIT 50
+    `);
+
+    const now = Date.now();
+    const due = [];
+    for (const row of pending.rows) {
+      const ageMin = (now - new Date(row.detected_at).getTime()) / 60000;
+      const horizons = [
+        [1, 'outcome_1m_pct', 'outcome_1m_at'],
+        [3, 'outcome_3m_pct', 'outcome_3m_at'],
+        [5, 'outcome_5m_pct', 'outcome_5m_at'],
+        [10, 'outcome_10m_pct', 'outcome_10m_at'],
+      ];
+      for (const [mins, pctField, atField] of horizons) {
+        if (ageMin >= mins && row[pctField] == null) {
+          due.push({ row, mins, pctField, atField });
+          break; // one snapshot can satisfy all currently-due horizons for this signal
+        }
+      }
+    }
+
+    await runWithConcurrency(due, Math.min(4, TOP20_CONCURRENCY), async item => {
+      const { row } = item;
+      const currentPrice = await fetchMassiveTickerPrice(row.ticker);
+      if (!(currentPrice > 0) || !(Number(row.price) > 0)) return;
+      const ageMin = (Date.now() - new Date(row.detected_at).getTime()) / 60000;
+      const pct = ((currentPrice - Number(row.price)) / Number(row.price)) * 100;
+      const sets = [];
+      const vals = [];
+      let p = 1;
+      for (const mins of [1, 3, 5, 10]) {
+        const pctField = `outcome_${mins}m_pct`;
+        const atField = `outcome_${mins}m_at`;
+        if (ageMin >= mins && row[pctField] == null) {
+          sets.push(`${pctField} = $${p++}`, `${atField} = now()`);
+          vals.push(Number(pct.toFixed(4)));
+        }
+      }
+      if (!sets.length) return;
+      vals.push(row.id);
+      await pool.query(
+        `UPDATE top20_signal_log SET ${sets.join(', ')} WHERE id = $${p}`,
+        vals
+      );
+      top20OutcomeUpdates += sets.length / 2;
+    });
+  } catch (e) {
+    console.error('[TOP20][OUTCOME] error:', e.message);
+  }
+}
+
 // ===== BASE44 =====
 async function pushToBase44(alert) {
   if (!BASE44_INGEST_URL || !BASE44_API_KEY) return;
@@ -423,7 +667,6 @@ function formatTelegram(a) {
     if (meta?.score       != null) scoreText = `Score: <b>${Math.round(meta.score)}</b>\n`;
     if (meta?.volumeTrend != null) trendText = `Trend: ${Number(meta.volumeTrend).toFixed(2)}\n`;
   } catch {}
-
   return (
     `🚀 <b>Quantum Scan (${type})</b>\n` +
     `<b>${a.ticker}</b>  $${price}  (<b>${pct}%</b>)\n` +
@@ -444,7 +687,6 @@ function formatEarlyTelegram({ ticker, price, pct, rvol, float, volumeAccel, vol
     `<a href="${tv}">Chart →</a>`
   );
 }
-
 function formatTop20Telegram(result, timing = {}) {
   const {
     ticker, rank, price, pct, volume, score, criteria, bonus,
@@ -459,6 +701,19 @@ function formatTop20Telegram(result, timing = {}) {
   const bonusLine = bonus?.freshSmaCross
     ? `⚡ <b>BONUS:</b> Fresh 10/100 SMA crossover ${crossBarsAgo === 0 ? "now" : `${crossBarsAgo}m ago`}\n`
     : `➖ Bonus: No fresh 10/100 crossover in last ${TOP20_CROSS_LOOKBACK}m\n`;
+
+  const spike = result.oneMinuteVolumeSpike || {};
+  const spikeLine = spike.passed
+    ? (
+        `🚨 <b>5X 1-MINUTE VOLUME SPIKE</b> — ` +
+        `${Number(spike.multiplier || 0).toFixed(2)}x\n` +
+        `Candle volume: ${Number(spike.candleVolume || 0).toLocaleString()} ` +
+        `vs ${Number(spike.baselineAverageVolume || 0).toLocaleString()} average\n`
+      )
+    : (
+        `➖ 1m volume spike: ${Number(spike.multiplier || 0).toFixed(2)}x ` +
+        `(needs ${TOP20_1M_SPIKE_MULTIPLIER.toFixed(1)}x + confirmed uptrend)\n`
+      );
 
   const q = result.momentumQuality || {};
   const qualityIcon =
@@ -477,6 +732,38 @@ function formatTop20Telegram(result, timing = {}) {
   const safetyLine = safety.passed
     ? `🛡️ Safety Filter: <b>PASS</b>\n`
     : `🛑 Safety Filter: <b>BLOCKED</b> — ${(safety.reasons || []).join(", ").replaceAll("_", " ")}\n`;
+
+  const l1 = result.level1 || {};
+  const l1Icon =
+    l1.pressure === "BUY_PRESSURE" ? "🟢" :
+    l1.pressure === "SELL_PRESSURE" ? "🔴" :
+    l1.pressure === "WIDE_SPREAD" ? "🟡" :
+    l1.pressure === "STALE" ? "⚪" : "🟡";
+
+  const l1Label =
+    l1.pressure === "BUY_PRESSURE" ? "BUY PRESSURE CONFIRMED" :
+    l1.pressure === "SELL_PRESSURE" ? "SELL PRESSURE" :
+    l1.pressure === "WIDE_SPREAD" ? "WIDE SPREAD / NEUTRAL" :
+    l1.pressure === "STALE" ? "STALE QUOTE" :
+    l1.pressure === "ERROR" ? "QUOTE ERROR" :
+    l1.pressure === "DISABLED" ? "DISABLED" :
+    "NEUTRAL";
+
+  const level1Lines =
+    TOP20_LEVEL1_ENABLED && l1.available
+      ? (
+          `📊 <b>LEVEL 1</b> — ${l1Icon} <b>${l1Label}</b>\n` +
+          `Bid: $${Number(l1.bid || 0).toFixed(2)} x ${Number(l1.bidSize || 0).toLocaleString()}   ` +
+          `Ask: $${Number(l1.ask || 0).toFixed(2)} x ${Number(l1.askSize || 0).toLocaleString()}\n` +
+          `Bid/Ask Ratio: ${l1.ratio != null ? Number(l1.ratio).toFixed(2) : "—"}x   ` +
+          `Spread: ${l1.spreadPct != null ? Number(l1.spreadPct).toFixed(2) : "—"}%   ` +
+          `Quote age: ${l1.quoteAgeSec != null ? Number(l1.quoteAgeSec).toFixed(1) : "—"}s\n`
+        )
+      : (
+          TOP20_LEVEL1_ENABLED
+            ? `📊 <b>LEVEL 1</b> — ⚪ Quote unavailable\n`
+            : `📊 <b>LEVEL 1</b> — Disabled\n`
+        );
 
   const detectedAtMs = Number(result.detectedAtMs || timing.detectedAtMs || Date.now());
   const scanStartedAtMs = Number(timing.scanStartedAtMs || detectedAtMs);
@@ -499,13 +786,20 @@ function formatTop20Telegram(result, timing = {}) {
     `${criteria.volume ? "✅" : "❌"} Volume ≥ ${TOP20_MIN_VOLUME.toLocaleString()}\n` +
     `${criteria.threeGreen ? "✅" : "❌"} 3 Green 1m Candles + Bullish Progression\n` +
     `${criteria.sma100Up ? "✅" : "❌"} 100 SMA Trending Up (${Number(sma100SlopePct).toFixed(3)}%)\n\n` +
-    `${bonusLine}` +
-    `${qualityLine}${riskLine}${safetyLine}\n` +
+    `${bonusLine}${spikeLine}` +
+    `${qualityLine}${riskLine}${safetyLine}` +
+    `${level1Lines}\n` +
     `SMA10: ${Number(sma10).toFixed(3)}   SMA100: ${Number(sma100).toFixed(3)}\n` +
     (score >= 5
-      ? (bonus?.freshSmaCross
-          ? `⭐ <b>PERFECT SETUP — 5/5 + CROSSOVER BONUS</b>\n`
-          : `⭐ <b>PERFECT SETUP — 5/5</b>\n`)
+      ? (
+          bonus?.freshSmaCross && bonus?.oneMinuteVolumeSpike
+            ? `⭐ <b>PERFECT SETUP — 5/5 + CROSSOVER + 5X VOLUME</b>\n`
+            : bonus?.oneMinuteVolumeSpike
+              ? `⭐ <b>PERFECT SETUP — 5/5 + 5X VOLUME</b>\n`
+              : bonus?.freshSmaCross
+                ? `⭐ <b>PERFECT SETUP — 5/5 + CROSSOVER BONUS</b>\n`
+                : `⭐ <b>PERFECT SETUP — 5/5</b>\n`
+        )
       : (bonus?.freshSmaCross
           ? `Setup Score: <b>${score}/5 + ⚡ crossover bonus</b>\n`
           : `Setup Score: <b>${score}/5</b>\n`)) +
@@ -521,6 +815,7 @@ const cache = {
   news:       new Map(),
   minuteAggs: new Map(),
 };
+
 function getCache(map, key) {
   const entry = map.get(key);
   if (!entry) return null;
@@ -601,9 +896,9 @@ async function fetchAllSnapshotTickers() {
       ? nextUrl
       : `${nextUrl}${nextUrl.includes("?") ? "&" : "?"}apiKey=${POLYGON_KEY}`;
   }
-
   return all;
 }
+
 function computePercentChange(t) {
   const prevClose = Number(t?.prevDay?.c || 0);
   if (prevClose <= 0) return 0;
@@ -624,6 +919,7 @@ async function getAvgDailyVolume(ticker, prevDayVol = 0) {
   const lookbackCalendarDays = Math.max(AVG_VOL_DAYS * 2, 40);
   const to   = new Date().toISOString().slice(0, 10);
   const from = new Date(Date.now() - lookbackCalendarDays * 86_400_000).toISOString().slice(0, 10);
+
   const url =
     `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}` +
     `/range/1/day/${from}/${to}?adjusted=true&sort=desc&limit=50000&apiKey=${POLYGON_KEY}`;
@@ -641,7 +937,6 @@ async function getAvgDailyVolume(ticker, prevDayVol = 0) {
   setCache(cache.avgVol, ticker, avg, 6 * 3_600_000);
   return avg;
 }
-
 async function getFloatInfo(ticker) {
   const cached = getCache(cache.float, ticker);
   if (cached != null) return cached;
@@ -686,6 +981,7 @@ async function hasRecentNews(ticker, lookbackMin) {
     const data = await polygonJson(url);
     ok = Array.isArray(data?.results) && data.results.length > 0;
   } catch { ok = false; }
+
   setCache(cache.news, key, ok, 2 * 60_000);
   return ok;
 }
@@ -724,7 +1020,6 @@ async function computePremarketVolumeAndSpike(ticker) {
     ticker,
     Math.max(VOLUME_BASELINE_MIN, VOLUME_LOOKBACK_MIN) + 10
   );
-
   const totalVol  = bars.reduce((sum, b) => sum + b.v, 0);
   const sortedAsc = [...bars].sort((a, b) => a.t - b.t);
   const lastN     = sortedAsc.slice(-VOLUME_LOOKBACK_MIN);
@@ -808,7 +1103,6 @@ function tickerInAnyCooldown(ticker) {
   const types = ["EARLY", "RUNNER", "GAPPER", "PM_BREAKOUT", "LOW_FLOAT_SQUEEZE"];
   return types.some(t => inCooldown(`${ticker}:${t}`));
 }
-
 // ===== CONCURRENCY =====
 async function runWithConcurrency(items, limit, workerFn) {
   const results = new Array(items.length);
@@ -865,6 +1159,130 @@ async function massiveJson(pathOrUrl, attempt = 0) {
 
   return resp.json();
 }
+async function getTop20Level1Quote(ticker) {
+  if (!TOP20_LEVEL1_ENABLED) {
+    return {
+      enabled: false,
+      available: false,
+      pressure: "DISABLED",
+      bullish: false,
+      bearish: false,
+      neutral: true,
+    };
+  }
+
+  try {
+    const data = await massiveJson(`/v2/last/nbbo/${encodeURIComponent(ticker)}`);
+    const q = data?.results || {};
+
+    const bid = Number(q.p || 0);
+    const ask = Number(q.P || 0);
+    const bidSize = Number(q.s || 0);
+    const askSize = Number(q.S || 0);
+    // Massive's stock NBBO timestamp is nanoseconds.
+    const quoteTimestampNs = Number(q.t || q.y || q.f || 0);
+    const quoteTimestampMs =
+      quoteTimestampNs > 1e15
+        ? Math.floor(quoteTimestampNs / 1e6)
+        : quoteTimestampNs > 1e12
+          ? Math.floor(quoteTimestampNs / 1e3)
+          : quoteTimestampNs > 0
+            ? quoteTimestampNs
+            : 0;
+
+    const quoteAgeSec =
+      quoteTimestampMs > 0
+        ? Math.max(0, (Date.now() - quoteTimestampMs) / 1000)
+        : null;
+
+    const valid =
+      bid > 0 &&
+      ask > 0 &&
+      ask >= bid &&
+      bidSize >= 0 &&
+      askSize >= 0;
+
+    if (!valid) {
+      return {
+        enabled: true,
+        available: false,
+        pressure: "UNAVAILABLE",
+        bullish: false,
+        bearish: false,
+        neutral: true,
+        bid,
+        ask,
+        bidSize,
+        askSize,
+        ratio: null,
+        spreadPct: null,
+        quoteAgeSec,
+      };
+    }
+
+    const mid = (bid + ask) / 2;
+    const spreadPct = mid > 0 ? ((ask - bid) / mid) * 100 : 0;
+    const ratio =
+      askSize > 0
+        ? bidSize / askSize
+        : bidSize > 0
+          ? Infinity
+          : 1;
+
+    const stale =
+      quoteAgeSec != null &&
+      quoteAgeSec > TOP20_LEVEL1_MAX_QUOTE_AGE_SEC;
+
+    const wideSpread = spreadPct > TOP20_LEVEL1_MAX_SPREAD_PCT;
+
+    let pressure = "NEUTRAL";
+    let bullish = false;
+    let bearish = false;
+
+    if (stale) {
+      pressure = "STALE";
+    } else if (ratio <= TOP20_LEVEL1_BEAR_RATIO) {
+      pressure = "SELL_PRESSURE";
+      bearish = true;
+    } else if (ratio >= TOP20_LEVEL1_BULL_RATIO && !wideSpread) {
+      pressure = "BUY_PRESSURE";
+      bullish = true;
+    } else if (wideSpread) {
+      pressure = "WIDE_SPREAD";
+    }
+
+    return {
+      enabled: true,
+      available: true,
+      pressure,
+      bullish,
+      bearish,
+      neutral: !bullish && !bearish,
+      bid,
+      ask,
+      bidSize,
+      askSize,
+      ratio: Number.isFinite(ratio) ? Number(ratio.toFixed(3)) : 999,
+      spreadPct: Number(spreadPct.toFixed(3)),
+      quoteAgeSec: quoteAgeSec != null ? Number(quoteAgeSec.toFixed(1)) : null,
+      stale,
+      wideSpread,
+      quoteTimestampMs,
+    };
+  } catch (e) {
+    console.error(`[TOP20][LEVEL1][${ticker}] error:`, e.message);
+    return {
+      enabled: true,
+      available: false,
+      pressure: "ERROR",
+      bullish: false,
+      bearish: false,
+      neutral: true,
+      error: e.message,
+    };
+  }
+}
+
 async function fetchTop20Gainers() {
   const data = await massiveJson(
     "/v2/snapshot/locale/us/markets/stocks/gainers"
@@ -1278,13 +1696,168 @@ function evaluateTop20Safety({ leader, bars, macd, sma10, momentumQuality }) {
     },
   };
 }
+
+function evaluateOneMinuteVolumeSpike({ bars, sma10, sma100, sma100Up, sma10SlopePct }) {
+  const empty = {
+    enabled: TOP20_1M_SPIKE_ENABLED,
+    passed: false,
+    uptrendConfirmed: false,
+    multiplier: 0,
+    candleVolume: 0,
+    baselineAverageVolume: 0,
+    baselineBarsUsed: 0,
+    candleTimestampMs: null,
+    candleGreen: false,
+    higherClose: false,
+    reason: "UNAVAILABLE",
+  };
+
+  if (!TOP20_1M_SPIKE_ENABLED || !Array.isArray(bars)) {
+    return { ...empty, reason: TOP20_1M_SPIKE_ENABLED ? "NO_BARS" : "DISABLED" };
+  }
+
+  // Use only fully completed 1-minute candles.
+  const completedCutoff =
+    Date.now() - 60_000 - Math.max(0, TOP20_1M_SPIKE_COMPLETION_GRACE_MS);
+
+  const completed = bars
+    .filter(b =>
+      Number.isFinite(b?.t) &&
+      Number.isFinite(b?.v) &&
+      Number.isFinite(b?.o) &&
+      Number.isFinite(b?.c) &&
+      b.t <= completedCutoff
+    )
+    .sort((a, b) => a.t - b.t);
+
+  const required = Math.max(2, TOP20_1M_SPIKE_BASELINE_BARS + 1);
+  if (completed.length < required) {
+    return {
+      ...empty,
+      baselineBarsUsed: Math.max(0, completed.length - 1),
+      reason: "INSUFFICIENT_COMPLETED_BARS",
+    };
+  }
+
+  const spikeBar = completed[completed.length - 1];
+  const previousBar = completed[completed.length - 2];
+  const baseline = completed
+    .slice(-(TOP20_1M_SPIKE_BASELINE_BARS + 1), -1)
+    .filter(b => b.v > 0);
+
+  if (!baseline.length) {
+    return {
+      ...empty,
+      candleTimestampMs: spikeBar.t,
+      candleVolume: Number(spikeBar.v || 0),
+      reason: "NO_BASELINE_VOLUME",
+    };
+  }
+
+  const baselineAverageVolume =
+    baseline.reduce((sum, b) => sum + Number(b.v || 0), 0) / baseline.length;
+
+  const multiplier =
+    baselineAverageVolume > 0
+      ? Number(spikeBar.v || 0) / baselineAverageVolume
+      : 0;
+
+  const candleGreen = spikeBar.c > spikeBar.o;
+  const higherClose = spikeBar.c > previousBar.c;
+
+  // The 5x candle only counts when the stock is already trending upward.
+  const uptrendConfirmed = Boolean(
+    sma10 != null &&
+    sma100 != null &&
+    sma10 > sma100 &&
+    sma100Up &&
+    Number(sma10SlopePct || 0) > 0 &&
+    spikeBar.c > sma10 &&
+    candleGreen &&
+    higherClose
+  );
+
+  const passed =
+    uptrendConfirmed &&
+    multiplier >= TOP20_1M_SPIKE_MULTIPLIER;
+
+  let reason = "PASS";
+  if (!uptrendConfirmed) reason = "UPTREND_NOT_CONFIRMED";
+  else if (multiplier < TOP20_1M_SPIKE_MULTIPLIER) reason = "BELOW_MULTIPLIER";
+
+  return {
+    enabled: true,
+    passed,
+    uptrendConfirmed,
+    multiplier: Number(multiplier.toFixed(3)),
+    candleVolume: Math.round(Number(spikeBar.v || 0)),
+    baselineAverageVolume: Math.round(baselineAverageVolume),
+    baselineBarsUsed: baseline.length,
+    candleTimestampMs: spikeBar.t,
+    candleGreen,
+    higherClose,
+    reason,
+  };
+}
+
+function evaluateTop20DataQuality(bars) {
+  const reasons = [];
+  const metrics = {
+    barAgeSec: null,
+    duplicateBars: 0,
+    zeroVolumeRatio: 0,
+    malformedBars: 0,
+  };
+
+  if (!Array.isArray(bars) || bars.length < TOP20_MIN_BARS) {
+    reasons.push('INSUFFICIENT_BARS');
+    return { passed: false, reasons, metrics };
+  }
+
+  let malformed = 0;
+  let duplicates = 0;
+  const seen = new Set();
+  for (const b of bars) {
+    if (
+      !Number.isFinite(b.t) || !Number.isFinite(b.o) || !Number.isFinite(b.h) ||
+      !Number.isFinite(b.l) || !Number.isFinite(b.c) || !Number.isFinite(b.v) ||
+      b.o <= 0 || b.h <= 0 || b.l <= 0 || b.c <= 0 || b.h < b.l
+    ) malformed++;
+    if (seen.has(b.t)) duplicates++;
+    seen.add(b.t);
+  }
+
+  metrics.malformedBars = malformed;
+  metrics.duplicateBars = duplicates;
+  if (malformed > 0) reasons.push('MALFORMED_BARS');
+  if (duplicates > 0) reasons.push('DUPLICATE_BARS');
+
+  const latest = bars[bars.length - 1];
+  const barAgeSec = latest?.t ? (Date.now() - latest.t) / 1000 : Infinity;
+  metrics.barAgeSec = Number.isFinite(barAgeSec) ? Number(barAgeSec.toFixed(1)) : null;
+  if (!Number.isFinite(barAgeSec) || barAgeSec > TOP20_MAX_BAR_AGE_SEC) {
+    reasons.push('STALE_DATA');
+  }
+
+  const recent = bars.slice(-20);
+  const zeroVol = recent.filter(b => !(b.v > 0)).length;
+  const zeroVolumeRatio = recent.length ? zeroVol / recent.length : 1;
+  metrics.zeroVolumeRatio = Number(zeroVolumeRatio.toFixed(3));
+  if (zeroVolumeRatio > TOP20_MAX_ZERO_VOL_RATIO) reasons.push('TOO_MANY_ZERO_VOLUME_BARS');
+
+  return { passed: reasons.length === 0, reasons, metrics };
+}
+
 function evaluateTop20Technical(leader, bars) {
+  const dataQuality = evaluateTop20DataQuality(bars);
   if (!bars || bars.length < TOP20_MIN_BARS) {
     return {
       ...leader,
       insufficientBars: true,
       barsAvailable: bars?.length || 0,
       score: 0,
+      dataQuality,
+      detectedAtMs: Date.now(),
     };
   }
 
@@ -1319,8 +1892,10 @@ function evaluateTop20Technical(leader, bars) {
       currentSma100 > pastSma100
     ),
   };
+
   const bonus = {
     freshSmaCross: Boolean(cross.passed),
+    oneMinuteVolumeSpike: false,
   };
 
   const score = Object.values(criteria).filter(Boolean).length;
@@ -1342,6 +1917,40 @@ function evaluateTop20Technical(leader, bars) {
     momentumQuality,
   });
 
+  const oneMinuteVolumeSpike = evaluateOneMinuteVolumeSpike({
+    bars,
+    sma10: currentSma10,
+    sma100: currentSma100,
+    sma100Up: criteria.sma100Up,
+    sma10SlopePct: safety.metrics?.sma10SlopePct,
+  });
+
+  // It is a bonus by default. Make it mandatory only through Railway.
+  if (TOP20_REQUIRE_1M_SPIKE_FOR_ALERT && !oneMinuteVolumeSpike.passed) {
+    safety.passed = false;
+    safety.reasons = [
+      ...new Set([...(safety.reasons || []), "MISSING_5X_1M_VOLUME_SPIKE"]),
+    ];
+  }
+
+  // Contradiction guard: core bullish score cannot override clearly bearish immediate conditions.
+  const contradictionReasons = [];
+  if (criteria.sma10Above100 && !safety.metrics?.priceAboveSma10) contradictionReasons.push('PRICE_BELOW_10SMA');
+  if (criteria.macdPositive && !momentumQuality.metrics?.macdStrengthening) contradictionReasons.push('MACD_WEAKENING');
+  if (momentumQuality.metrics?.redVolumeRatio > TOP20_MAX_RED_VOLUME_RATIO) contradictionReasons.push('HEAVY_RED_VOLUME');
+  if (safety.metrics?.recentMomentumPct < TOP20_MIN_RECENT_MOMENTUM_PCT) contradictionReasons.push('RECENT_MOMENTUM_WEAK');
+
+  if (!dataQuality.passed) {
+    safety.passed = false;
+    safety.reasons = [...new Set([...(safety.reasons || []), ...dataQuality.reasons])];
+  }
+  if (contradictionReasons.length) {
+    safety.passed = false;
+    safety.reasons = [...new Set([...(safety.reasons || []), ...contradictionReasons])];
+  }
+
+  bonus.oneMinuteVolumeSpike = Boolean(oneMinuteVolumeSpike.passed);
+
   const detectedAtMs = Date.now();
   const lastCompletedBarAtMs = bars[bars.length - 1]?.t || 0;
 
@@ -1350,8 +1959,10 @@ function evaluateTop20Technical(leader, bars) {
     score,
     criteria,
     bonus,
+    oneMinuteVolumeSpike,
     momentumQuality,
     safety,
+    dataQuality,
     detectedAtMs,
     lastCompletedBarAtMs,
     macdLine: macd?.macd ?? 0,
@@ -1377,7 +1988,6 @@ function serializeTop20Result(result) {
     percentChange: Number(Number(result.pct || 0).toFixed(2)),
     volume: Math.round(Number(result.volume || 0)),
     score: Number(result.score || 0),
-
     // The five core criteria shown in Base44.
     macdPositive: Boolean(c.macdPositive),
     sma10Above100: Boolean(c.sma10Above100),
@@ -1385,9 +1995,20 @@ function serializeTop20Result(result) {
     threeGreen: Boolean(c.threeGreen),
     sma100Rising: Boolean(c.sma100Up),
 
-    // Fresh crossover is a BONUS, not part of the 5-point score.
+    // Bonuses do not change the core 5-point score.
     freshCross: Boolean(b.freshSmaCross),
     crossMinutesAgo: result.crossBarsAgo != null ? Number(result.crossBarsAgo) : null,
+
+    oneMinuteVolumeSpike: Boolean(result.oneMinuteVolumeSpike?.passed),
+    oneMinuteVolumeSpikeUptrend: Boolean(result.oneMinuteVolumeSpike?.uptrendConfirmed),
+    oneMinuteVolumeMultiplier: Number(result.oneMinuteVolumeSpike?.multiplier || 0),
+    oneMinuteSpikeCandleVolume: Number(result.oneMinuteVolumeSpike?.candleVolume || 0),
+    oneMinuteSpikeBaselineAverage: Number(result.oneMinuteVolumeSpike?.baselineAverageVolume || 0),
+    oneMinuteSpikeBaselineBars: Number(result.oneMinuteVolumeSpike?.baselineBarsUsed || 0),
+    oneMinuteSpikeReason: String(result.oneMinuteVolumeSpike?.reason || "UNAVAILABLE"),
+    oneMinuteSpikeCandleAt: result.oneMinuteVolumeSpike?.candleTimestampMs
+      ? new Date(result.oneMinuteVolumeSpike.candleTimestampMs).toISOString()
+      : null,
 
     momentumQuality: Number(result.momentumQuality?.score || 0),
     momentumQualityLabel: String(result.momentumQuality?.label || "UNAVAILABLE"),
@@ -1408,7 +2029,26 @@ function serializeTop20Result(result) {
     sma10SlopePct: Number(result.safety?.metrics?.sma10SlopePct || 0),
     recentMomentumPct: Number(result.safety?.metrics?.recentMomentumPct || 0),
     avgUpperWickRatio: Number(result.safety?.metrics?.avgUpperWickRatio || 0),
+    // Level 1 NBBO buy-pressure confirmation (bonus only).
+    level1Enabled: Boolean(result.level1?.enabled),
+    level1Available: Boolean(result.level1?.available),
+    level1Pressure: String(result.level1?.pressure || "UNAVAILABLE"),
+    level1Bullish: Boolean(result.level1?.bullish),
+    level1Bearish: Boolean(result.level1?.bearish),
+    level1Bid: Number(result.level1?.bid || 0),
+    level1Ask: Number(result.level1?.ask || 0),
+    level1BidSize: Number(result.level1?.bidSize || 0),
+    level1AskSize: Number(result.level1?.askSize || 0),
+    level1BidAskRatio: result.level1?.ratio != null ? Number(result.level1.ratio) : null,
+    level1SpreadPct: result.level1?.spreadPct != null ? Number(result.level1.spreadPct) : null,
+    level1QuoteAgeSec: result.level1?.quoteAgeSec != null ? Number(result.level1.quoteAgeSec) : null,
 
+    // Data freshness / quality guard.
+    dataQualityPass: Boolean(result.dataQuality?.passed),
+    dataQualityReasons: Array.isArray(result.dataQuality?.reasons) ? result.dataQuality.reasons : [],
+    barAgeSec: result.dataQuality?.metrics?.barAgeSec ?? null,
+    duplicateBars: Number(result.dataQuality?.metrics?.duplicateBars || 0),
+    zeroVolumeRatio: Number(result.dataQuality?.metrics?.zeroVolumeRatio || 0),
     // Timing fields so Base44 can show exactly how fresh the signal is.
     detectedAt: result.detectedAtMs ? new Date(result.detectedAtMs).toISOString() : null,
     lastCompletedBarAt: result.lastCompletedBarAtMs
@@ -1433,17 +2073,20 @@ function shouldSendTop20Alert(result) {
   const now = Date.now();
   const ticker = result.ticker;
   const freshBonus = Boolean(result.bonus?.freshSmaCross);
+  const volumeSpikeBonus = Boolean(result.bonus?.oneMinuteVolumeSpike);
   const state = top20AlertState.get(ticker) || {
     lastScore: 0,
     lastAlertScore: 0,
     lastAlertAt: 0,
     belowThresholdSince: 0,
     lastBonus: false,
+    lastVolumeSpikeBonus: false,
   };
 
   const score = result.score;
   const safetyPass = result.safety?.passed !== false;
   const qualifiesForAlert = score >= TOP20_MIN_SCORE && safetyPass;
+
   if (!qualifiesForAlert) {
     if (!state.belowThresholdSince) state.belowThresholdSince = now;
 
@@ -1452,6 +2095,7 @@ function shouldSendTop20Alert(result) {
       state.lastAlertScore = 0;
       state.lastAlertAt = 0;
       state.lastBonus = false;
+      state.lastVolumeSpikeBonus = false;
     }
 
     state.lastScore = score;
@@ -1467,6 +2111,7 @@ function shouldSendTop20Alert(result) {
     state.lastAlertScore = score;
     state.lastAlertAt = now;
     state.lastBonus = freshBonus;
+    state.lastVolumeSpikeBonus = volumeSpikeBonus;
     top20AlertState.set(ticker, state);
     return true;
   }
@@ -1477,6 +2122,7 @@ function shouldSendTop20Alert(result) {
     state.lastAlertScore = 5;
     state.lastAlertAt = now;
     state.lastBonus = freshBonus;
+    state.lastVolumeSpikeBonus = volumeSpikeBonus;
     top20AlertState.set(ticker, state);
     return true;
   }
@@ -1488,13 +2134,70 @@ function shouldSendTop20Alert(result) {
     state.lastAlertScore = Math.max(state.lastAlertScore, score);
     state.lastAlertAt = now;
     state.lastBonus = true;
+    state.lastVolumeSpikeBonus = volumeSpikeBonus;
+    top20AlertState.set(ticker, state);
+    return true;
+  }
+
+  // Send one upgrade alert if the setup later prints a NEW completed 1-minute
+  // candle with at least 5x its preceding 1-minute average volume.
+  if (volumeSpikeBonus && !state.lastVolumeSpikeBonus) {
+    state.lastScore = score;
+    state.lastAlertScore = Math.max(state.lastAlertScore, score);
+    state.lastAlertAt = now;
+    state.lastVolumeSpikeBonus = true;
+    state.lastBonus = freshBonus;
     top20AlertState.set(ticker, state);
     return true;
   }
 
   state.lastScore = score;
   state.lastBonus = freshBonus;
+  state.lastVolumeSpikeBonus = volumeSpikeBonus;
   top20AlertState.set(ticker, state);
+  return false;
+}
+
+
+async function handleTop20FeedFailure(error) {
+  top20FeedFailureCount++;
+  if (top20FeedFailureCount >= TOP20_CIRCUIT_BREAKER_FAILURES) {
+    top20CircuitOpen = true;
+    if (!top20CircuitNotified) {
+      top20CircuitNotified = true;
+      await pushToTelegram(
+        `⚠️ <b>TOP 20 SCALP PAUSED</b>\n` +
+        `Massive data feed failed ${top20FeedFailureCount} consecutive scans.\n` +
+        `Alerts are paused rather than using unreliable data.\n` +
+        `Last error: ${String(error?.message || error).slice(0, 250)}`
+      );
+    }
+  }
+}
+async function handleTop20FeedSuccess() {
+  const wasOpen = top20CircuitOpen;
+  top20FeedFailureCount = 0;
+  top20CircuitOpen = false;
+  if (wasOpen) {
+    top20LastFeedRecoveryAt = new Date().toISOString();
+    top20CircuitNotified = false;
+    await pushToTelegram(
+      `🟢 <b>TOP 20 SCALP DATA FEED RECOVERED</b>\n` +
+      `Massive data is responding again. Scanner alerts resumed.`
+    );
+  }
+}
+
+function shouldLogShadowSignal(result) {
+  if (!TOP20_SHADOW_MODE || result.score < TOP20_MIN_SCORE || result.safety?.passed) return false;
+  const key = result.ticker;
+  const now = Date.now();
+  const reasonsKey = (result.safety?.reasons || []).slice().sort().join('|');
+  const prev = top20ShadowState.get(key);
+  if (!prev || prev.reasonsKey !== reasonsKey || now - prev.at >= TOP20_REARM_MIN * 60_000) {
+    top20ShadowState.set(key, { at: now, reasonsKey });
+    return true;
+  }
   return false;
 }
 
@@ -1517,6 +2220,8 @@ async function scanTop20Technicals() {
   let qualifying4 = 0;
   let qualifying5 = 0;
   let alertsThisRun = 0;
+  let tickerErrors = 0;
+  let shadowThisRun = 0;
 
   try {
     const leaders = await fetchTop20Gainers();
@@ -1538,18 +2243,19 @@ async function scanTop20Technicals() {
           const result = evaluateTop20Technical(leader, bars);
           return result;
         } catch (e) {
+          tickerErrors++;
           console.error(`[TOP20][${leader.ticker}] error:`, e.message);
           return null;
         }
       }
     );
 
-    // Publish the complete current Top-20 state for Base44, including 0/5–5/5 names.
-    // Sort by technical score first, then original gainer rank, matching the app design.
-    top20LastResults = evaluated
-      .filter(Boolean)
-      .map(serializeTop20Result)
-      .sort((a, b) => (b.score - a.score) || (a.rank - b.rank));
+    // Scan-level feed health. A main request failure is caught below; excessive per-ticker
+    // failures are also treated as degraded data so alerts do not continue blindly.
+    if (leadersFetched === 0 || (leadersFetched > 0 && tickerErrors / leadersFetched > 0.5)) {
+      throw new Error(`Top20 feed degraded: leaders=${leadersFetched}, tickerErrors=${tickerErrors}`);
+    }
+    await handleTop20FeedSuccess();
 
     for (const result of evaluated.filter(Boolean)) {
       if (result.insufficientBars) {
@@ -1560,6 +2266,31 @@ async function scanTop20Technicals() {
       analyzed++;
       if (result.score === 4) qualifying4++;
       if (result.score === 5) qualifying5++;
+
+      // Level 1 is fetched only for 4/5 or 5/5 setups (including shadow candidates).
+      // This keeps the scanner fast and avoids 20 extra quote calls every 10 seconds.
+      if (TOP20_LEVEL1_ENABLED && result.score >= TOP20_MIN_SCORE) {
+        result.level1 = await getTop20Level1Quote(result.ticker);
+      } else {
+        result.level1 = {
+          enabled: TOP20_LEVEL1_ENABLED,
+          available: false,
+          pressure: result.score >= TOP20_MIN_SCORE ? "UNAVAILABLE" : "NOT_CHECKED",
+          bullish: false,
+          bearish: false,
+          neutral: true,
+        };
+      }
+
+      if (shouldLogShadowSignal(result)) {
+        shadowThisRun++;
+        top20ShadowSignals++;
+        await recordTop20Signal(result, "SHADOW", result.safety?.reasons || []);
+        console.log(
+          `[TOP20][SHADOW] #${result.rank} ${result.ticker} score=${result.score}/5 ` +
+          `blocked=${(result.safety?.reasons || []).join(",")}`
+        );
+      }
 
       const shouldAlert = shouldSendTop20Alert(result);
 
@@ -1577,6 +2308,7 @@ async function scanTop20Technicals() {
         );
         const telegramApiMs = Date.now() - telegramStartedAt;
 
+        await recordTop20Signal(result, "ALERT", []);
         alertsThisRun++;
         top20AlertsSent++;
         console.log(
@@ -1588,9 +2320,16 @@ async function scanTop20Technicals() {
         );
       }
     }
+    // Publish the complete current Top-20 state for Base44 AFTER Level 1 enrichment.
+    top20LastResults = evaluated
+      .filter(Boolean)
+      .map(serializeTop20Result)
+      .sort((a, b) => (b.score - a.score) || (a.rank - b.rank));
+
   } catch (e) {
     top20LastError = e.message;
     console.error("TOP20 scan error:", e.message);
+    await handleTop20FeedFailure(e);
   } finally {
     top20LastFinishedAt = new Date().toISOString();
     top20LastDurationMs = Date.now() - started;
@@ -1601,16 +2340,19 @@ async function scanTop20Technicals() {
       qualifying4,
       qualifying5,
       alertsThisRun,
+      tickerErrors,
+      shadowThisRun,
+      circuitOpen: top20CircuitOpen,
     };
     top20IsScanning = false;
   }
-}
-
+                                                     }
 // ============================================================================
 // EXISTING SCANNER
 // ============================================================================
 async function scan() {
   lastLoopAt = new Date().toISOString();
+
   // Master switch for the existing Quantum scanner only.
   if (!QUANTUM_ENABLED) {
     return;
@@ -1835,7 +2577,6 @@ async function scan() {
 
     scoredAlerts.sort((a, b) => b.score - a.score);
     const topAlerts = scoredAlerts.slice(0, TOP_ALERTS_PER_SCAN);
-
     for (const payload of topAlerts) {
       const inserted = await insertAlert(payload);
       await pushToBase44(inserted);
@@ -1862,6 +2603,65 @@ async function scan() {
   }
 }
 
+
+function pacificDateKey(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(date);
+}
+
+function pacificHourMinuteNow() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(new Date());
+  return {
+    hour: Number(parts.find(p => p.type === "hour")?.value || 0),
+    minute: Number(parts.find(p => p.type === "minute")?.value || 0),
+  };
+}
+
+async function runTop20DailySelfTest() {
+  if (!TOP20_SELF_TEST_ENABLED || !TOP20_ENABLED) return;
+  const { hour, minute } = pacificHourMinuteNow();
+  if (hour !== TOP20_SELF_TEST_HOUR_PT || minute < TOP20_SELF_TEST_MINUTE_PT) return;
+
+  const day = pacificDateKey();
+  if (top20LastSelfTestDate === day) return;
+  top20LastSelfTestDate = day;
+
+  const checks = { database: false, massive: false, telegramConfigured: false };
+  const errors = [];
+  try { await pool.query('SELECT 1'); checks.database = true; } catch (e) { errors.push(`DB: ${e.message}`); }
+  try {
+    const leaders = await fetchTop20Gainers();
+    checks.massive = Array.isArray(leaders) && leaders.length > 0;
+    if (!checks.massive) errors.push('Massive: no top gainers returned');
+  } catch (e) { errors.push(`Massive: ${e.message}`); }
+  checks.telegramConfigured = Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+  if (!checks.telegramConfigured) errors.push('Telegram: not configured');
+
+  const ok = checks.database && checks.massive && checks.telegramConfigured;
+  top20LastSelfTest = { at: new Date().toISOString(), ok, checks, errors };
+
+  const lines = [
+    ok ? '🟢 <b>TOP 20 SCALP READY</b>' : '⚠️ <b>TOP 20 SCALP SELF-TEST WARNING</b>',
+    `Database: ${checks.database ? '✅' : '❌'}`,
+    `Massive: ${checks.massive ? '✅' : '❌'}`,
+    `Telegram: ${checks.telegramConfigured ? '✅' : '❌'}`,
+  ];
+  if (errors.length) lines.push(`Issues: ${errors.join(' | ').slice(0, 500)}`);
+  await pushToTelegram(lines.join('\n'));
+}
+
+async function top20MaintenanceLoop() {
+  await Promise.allSettled([
+    runTop20DailySelfTest(),
+    updateTop20Outcomes(),
+  ]);
+}
+
 // ===== START =====
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {
@@ -1879,5 +2679,10 @@ scan();
 setInterval(scan, SCAN_INTERVAL_MS);
 
 // New Top-20 Scalp scanner
+ensureTop20TrackingTable().catch(e => console.error("Top20 tracking init error:", e.message));
 scanTop20Technicals();
 setInterval(scanTop20Technicals, TOP20_SCAN_INTERVAL_MS);
+
+// Reliability / learning maintenance: self-test + 1/3/5/10-minute outcome tracking.
+top20MaintenanceLoop();
+setInterval(top20MaintenanceLoop, 15_000);
