@@ -72,6 +72,9 @@ const TOP20_ENABLED            = process.env.TOP20_ENABLED !== "false";
 // gainer universe. Default is the Top 50 U.S. gainers.
 const TOP20_GAINERS_LIMIT      = Number(process.env.TOP20_GAINERS_LIMIT || 50);
 const TOP20_UNIVERSE_MIN_VOLUME = Number(process.env.TOP20_UNIVERSE_MIN_VOLUME || 10000);
+const TOP20_PRICE_MIN          = Number(process.env.TOP20_PRICE_MIN || 1);
+const TOP20_PRICE_MAX          = Number(process.env.TOP20_PRICE_MAX || 10);
+const TOP20_TRIGGER_MIN_CANDLE_VOLUME = Number(process.env.TOP20_TRIGGER_MIN_CANDLE_VOLUME || 50000);
 const TOP20_SCAN_HISTORY_ENABLED = process.env.TOP20_SCAN_HISTORY_ENABLED !== "false";
 const TOP20_SCAN_HISTORY_RETENTION_HOURS = Number(process.env.TOP20_SCAN_HISTORY_RETENTION_HOURS || 48);
 const TOP20_TRIGGER_DEBUG_MULTIPLIER = Number(process.env.TOP20_TRIGGER_DEBUG_MULTIPLIER || 2);
@@ -260,6 +263,11 @@ app.get("/health", async (_req, res) => {
         config: {
           TOP20_START_HOUR_PT,
           TOP20_END_HOUR_PT,
+          TOP20_GAINERS_LIMIT,
+          TOP20_UNIVERSE_MIN_VOLUME,
+          TOP20_PRICE_MIN,
+          TOP20_PRICE_MAX,
+          TOP20_TRIGGER_MIN_CANDLE_VOLUME,
           TOP20_MIN_SCORE,
           TOP20_MIN_VOLUME,
           TOP20_CROSS_LOOKBACK,
@@ -325,7 +333,6 @@ function getTop20ScannerStatus() {
   if (top20IsScanning) return "SCANNING";
   return "ACTIVE";
 }
-
 // Latest Top-20 Scalp state for the Base44 visual dashboard.
 // This route only returns data already calculated by Railway; it does NOT trigger a new Massive scan.
 app.get("/top20", (_req, res) => {
@@ -514,7 +521,6 @@ async function insertAlert({ ticker, price, percent_change, rvol, float, news, a
   );
   return result.rows[0];
 }
-
 // Existing scanner cross-type cooldown — any DB alert on ticker blocks all existing alert types.
 // The new TOP20 scanner intentionally does NOT use this function, so it remains independent.
 async function wasAlertedRecently(ticker) {
@@ -627,6 +633,7 @@ async function updateTop20Outcomes() {
       ORDER BY detected_at ASC
       LIMIT 50
     `);
+
     const now = Date.now();
     const due = [];
     for (const row of pending.rows) {
@@ -723,7 +730,6 @@ async function recordTop20ScanHistory(rows) {
     console.error('[TOP-GAINERS][HISTORY] error:', e.message);
   }
 }
-
 // ===== BASE44 =====
 async function pushToBase44(alert) {
   if (!BASE44_INGEST_URL || !BASE44_API_KEY) return;
@@ -786,7 +792,6 @@ function formatTelegram(a) {
   const price = a.price != null ? Number(a.price).toFixed(2) : "—";
   const news  = a.news ? "✅" : "❌";
   const type  = a.alert_type || "ALERT";
-
   let scoreText = "";
   let trendText = "";
   try {
@@ -794,6 +799,7 @@ function formatTelegram(a) {
     if (meta?.score       != null) scoreText = `Score: <b>${Math.round(meta.score)}</b>\n`;
     if (meta?.volumeTrend != null) trendText = `Trend: ${Number(meta.volumeTrend).toFixed(2)}\n`;
   } catch {}
+
   return (
     `🚀 <b>Quantum Scan (${type})</b>\n` +
     `<b>${a.ticker}</b>  $${price}  (<b>${pct}%</b>)\n` +
@@ -814,6 +820,7 @@ function formatEarlyTelegram({ ticker, price, pct, rvol, float, volumeAccel, vol
     `<a href="${tv}">Chart →</a>`
   );
 }
+
 function formatTop20Telegram(result, timing = {}) {
   const {
     ticker, rank, price, pct, volume, score, criteria, bonus,
@@ -847,7 +854,6 @@ function formatTop20Telegram(result, timing = {}) {
 
   const qualityLine =
     `${qualityIcon} Momentum Quality: <b>${Math.round(q.score || 0)}/100 ${q.label || "UNAVAILABLE"}</b>\n`;
-
   const riskLine = Array.isArray(q.riskFlags) && q.riskFlags.length
     ? `⚠️ Risk: ${q.riskFlags.join(", ").replaceAll("_", " ")}\n`
     : `✅ Risk checks: Clean\n`;
@@ -1036,7 +1042,6 @@ async function getAvgDailyVolume(ticker, prevDayVol = 0) {
 
   const cached = getCache(cache.avgVol, ticker);
   if (cached != null) return cached;
-
   const lookbackCalendarDays = Math.max(AVG_VOL_DAYS * 2, 40);
   const to   = new Date().toISOString().slice(0, 10);
   const from = new Date(Date.now() - lookbackCalendarDays * 86_400_000).toISOString().slice(0, 10);
@@ -1044,6 +1049,7 @@ async function getAvgDailyVolume(ticker, prevDayVol = 0) {
   const url =
     `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}` +
     `/range/1/day/${from}/${to}?adjusted=true&sort=desc&limit=50000&apiKey=${POLYGON_KEY}`;
+
   const data = await polygonJson(url);
   const vols = (data?.results || [])
     .map(r => Number(r?.v || 0))
@@ -1064,6 +1070,7 @@ async function getFloatInfo(ticker) {
 
   const url =
     `https://api.polygon.io/v3/reference/tickers/${encodeURIComponent(ticker)}?apiKey=${POLYGON_KEY}`;
+
   try {
     const data = await polygonJson(url);
     const res  = data?.results || {};
@@ -1105,6 +1112,7 @@ async function hasRecentNews(ticker, lookbackMin) {
   setCache(cache.news, key, ok, 2 * 60_000);
   return ok;
 }
+
 async function getMinuteAggs(ticker, minutesBack) {
   const cacheKey = `${ticker}:${minutesBack}`;
   const cached   = getCache(cache.minuteAggs, cacheKey);
@@ -1117,7 +1125,6 @@ async function getMinuteAggs(ticker, minutesBack) {
   const url =
     `https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}` +
     `/range/1/minute/${from}/${to}?adjusted=true&sort=desc&limit=50000&apiKey=${POLYGON_KEY}`;
-
   const data     = await polygonJson(url);
   const filtered = (data?.results || [])
     .filter(r => Number(r?.t || 0) >= cutoff)
@@ -1188,6 +1195,7 @@ function computeMomentumScore({ pct, rvol, volumeAccel, volumeTrend, float, news
          : volumeAccel > 3    ? 15
          : volumeAccel > 2    ? 10
          : volumeAccel > 1.25 ? 5 : 0;
+
   score += volumeTrend > 2.0 ? 15
          : volumeTrend > 1.5 ? 10
          : volumeTrend > 1.0 ? 5
@@ -1200,7 +1208,6 @@ function computeMomentumScore({ pct, rvol, volumeAccel, volumeTrend, float, news
 
   if (news)     score += 10;
   if (breakout) score += 15;
-
   return score;
 }
 
@@ -1237,7 +1244,8 @@ async function runWithConcurrency(items, limit, workerFn) {
 
   await Promise.all(Array.from({ length: Math.max(1, limit) }, runner));
   return results;
-}
+  }
+
 // ============================================================================
 // NEW TOP-20 TECHNICAL SCANNER (MASSIVE -> RAILWAY -> TELEGRAM ONLY)
 // ============================================================================
@@ -1279,6 +1287,7 @@ async function massiveJson(pathOrUrl, attempt = 0) {
 
   return resp.json();
 }
+
 async function getTop20Level1Quote(ticker) {
   if (!TOP20_LEVEL1_ENABLED) {
     return {
@@ -1299,6 +1308,7 @@ async function getTop20Level1Quote(ticker) {
     const ask = Number(q.P || 0);
     const bidSize = Number(q.s || 0);
     const askSize = Number(q.S || 0);
+
     // Massive's stock NBBO timestamp is nanoseconds.
     const quoteTimestampNs = Number(q.t || q.y || q.f || 0);
     const quoteTimestampMs =
@@ -1339,7 +1349,6 @@ async function getTop20Level1Quote(ticker) {
         quoteAgeSec,
       };
     }
-
     const mid = (bid + ask) / 2;
     const spreadPct = mid > 0 ? ((ask - bid) / mid) * 100 : 0;
     const ratio =
@@ -1404,14 +1413,9 @@ async function getTop20Level1Quote(ticker) {
 }
 
 async function fetchTop20Gainers() {
-  // Massive's dedicated "gainers" endpoint is capped at 20. To watch the Top 50,
-  // use the Full Market Snapshot and rank the U.S. stock universe ourselves by
-  // percentage change from the previous close.
-  const data = await massiveJson(
-    "/v2/snapshot/locale/us/markets/stocks/tickers"
-  );
-
-  const tickers = Array.isArray(data?.tickers) ? data.tickers : [];
+  // Reuse the existing paginated full-market snapshot fetch so the Top-50
+  // ranking is built from the complete U.S. stock snapshot, not just page 1.
+  const tickers = await fetchAllSnapshotTickers();
 
   return tickers
     .map(t => {
@@ -1434,16 +1438,19 @@ async function fetchTop20Gainers() {
     })
     .filter(x =>
       x.ticker &&
-      /^[A-Z]{1,5}$/.test(x.ticker) &&
-      x.price > 0 &&
-      Number.isFinite(x.pct) &&
-      x.pct > 0 &&
-      x.volume >= TOP20_UNIVERSE_MIN_VOLUME
+      x.price >= TOP20_PRICE_MIN &&
+      x.price <= TOP20_PRICE_MAX &&
+      x.volume >= TOP20_UNIVERSE_MIN_VOLUME &&
+      /^[A-Z]{1,5}$/.test(x.ticker)
     )
     .sort((a, b) => b.pct - a.pct)
-    .slice(0, Math.max(1, TOP20_GAINERS_LIMIT))
-    .map((x, index) => ({ ...x, rank: index + 1 }));
+    .slice(0, TOP20_GAINERS_LIMIT)
+    .map((x, index) => ({
+      ...x,
+      rank: index + 1,
+    }));
 }
+
 // Cache technical bars until the next completed 1-minute candle.
 // This keeps the scanner fast without re-downloading 100+ bars every 10 seconds.
 const top20TechnicalBarCache = new Map();
@@ -1529,7 +1536,6 @@ function emaSeries(values, period) {
   const out = new Array(values.length).fill(null);
   const seed = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
   out[period - 1] = seed;
-
   const k = 2 / (period + 1);
   for (let i = period; i < values.length; i++) {
     out[i] = values[i] * k + out[i - 1] * (1 - k);
@@ -1548,6 +1554,7 @@ function computeMacd(values, fastPeriod = 12, slowPeriod = 26, signalPeriod = 9)
 
   const validMacd = macd.filter(v => v != null);
   if (validMacd.length < signalPeriod) return null;
+
   const signalValid = emaSeries(validMacd, signalPeriod);
   const signal = new Array(values.length).fill(null);
   let validIndex = 0;
@@ -1589,6 +1596,7 @@ function findRecentSmaCross(closes, fastPeriod, slowPeriod, lookbackBars) {
   }
 
   const maxLookback = Math.min(lookbackBars, closes.length - slowPeriod - 1);
+
   for (let barsAgo = 0; barsAgo <= maxLookback; barsAgo++) {
     const currEnd = closes.length - barsAgo;
     const prevEnd = currEnd - 1;
@@ -1631,7 +1639,6 @@ function evaluateThreeGreenBullish(bars) {
   // Bullish progression: each green candle closes higher than the prior candle.
   return a.c < b.c && b.c < c.c;
 }
-
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -1693,6 +1700,7 @@ function computeTop20MomentumQuality({ leader, bars, macd, sma10, sma100, sma100
     redVolumeRatio <= 0.35 ? 10 :
     redVolumeRatio <= 0.50 ? 7 :
     redVolumeRatio <= 0.65 ? 3 : 0;
+
   const recentForReclaim = bars.slice(-5);
   const hadPullback = recentForReclaim.slice(0, -1).some(b => b.l <= sma10);
   const reclaim = hadPullback && last.c > sma10 && last.c > last.o;
@@ -1734,6 +1742,7 @@ function computeTop20MomentumQuality({ leader, bars, macd, sma10, sma100, sma100
   ) {
     label = score >= 40 ? "CAUTION" : "WEAK";
   }
+
   return {
     score,
     rawScore: Math.round(rawScore),
@@ -1819,7 +1828,6 @@ function evaluateTop20Safety({ leader, bars, macd, sma10, momentumQuality }) {
   if (distanceAboveSma10Pct > TOP20_MAX_DISTANCE_ABOVE_SMA10_PCT) {
     reasons.push("TOO_EXTENDED_FROM_10SMA");
   }
-
   if (TOP20_REQUIRE_MACD_STRENGTHENING && !macd?.strengthening) {
     reasons.push("MACD_NOT_STRENGTHENING");
   }
@@ -1843,6 +1851,8 @@ function evaluateTop20Trigger(bars) {
     passed: false,
     uptrendConfirmed: false,
     volumeJumpPassed: false,
+    minCandleVolumePassed: false,
+    minRequiredCandleVolume: TOP20_TRIGGER_MIN_CANDLE_VOLUME,
     multiplier: 0,
     currentCandleVolume: 0,
     previousCandleVolume: 0,
@@ -1927,6 +1937,12 @@ function evaluateTop20Trigger(bars) {
   const volumeJumpPassed =
     multiplier >= TOP20_TRIGGER_VOLUME_MULTIPLIER;
 
+  // Liquidity guard: a 500 -> 5,000 share jump is 10x, but it is still a
+  // very thin candle. Require the trigger candle itself to trade at least
+  // the configured minimum number of shares.
+  const minCandleVolumePassed =
+    Number(current.v || 0) >= TOP20_TRIGGER_MIN_CANDLE_VOLUME;
+
   const uptrendConfirmed = Boolean(
     sma10Above100 &&
     (!TOP20_TRIGGER_REQUIRE_PRICE_ABOVE_SMA10 || priceAboveSma10) &&
@@ -1937,6 +1953,7 @@ function evaluateTop20Trigger(bars) {
   const passed = Boolean(
     uptrendConfirmed &&
     volumeJumpPassed &&
+    minCandleVolumePassed &&
     (!TOP20_TRIGGER_REQUIRE_GREEN || triggerCandleGreen) &&
     (!TOP20_TRIGGER_REQUIRE_HIGHER_CLOSE || higherClose)
   );
@@ -1944,6 +1961,7 @@ function evaluateTop20Trigger(bars) {
   let reason = "PASS";
   if (!uptrendConfirmed) reason = "UPTREND_NOT_CONFIRMED";
   else if (!volumeJumpPassed) reason = "NO_5X_PREVIOUS_CANDLE_JUMP";
+  else if (!minCandleVolumePassed) reason = "TRIGGER_CANDLE_VOLUME_TOO_LOW";
   else if (TOP20_TRIGGER_REQUIRE_GREEN && !triggerCandleGreen) {
     reason = "TRIGGER_CANDLE_NOT_GREEN";
   } else if (TOP20_TRIGGER_REQUIRE_HIGHER_CLOSE && !higherClose) {
@@ -1955,6 +1973,8 @@ function evaluateTop20Trigger(bars) {
     passed,
     uptrendConfirmed,
     volumeJumpPassed,
+    minCandleVolumePassed,
+    minRequiredCandleVolume: TOP20_TRIGGER_MIN_CANDLE_VOLUME,
     multiplier: Number(multiplier.toFixed(3)),
     currentCandleVolume: Math.round(Number(current.v || 0)),
     previousCandleVolume: Math.round(Number(previous.v || 0)),
@@ -1973,7 +1993,6 @@ function evaluateTop20Trigger(bars) {
     reason,
   };
 }
-
 
 function evaluateTop20DataQuality(bars) {
   const reasons = [];
@@ -2006,6 +2025,7 @@ function evaluateTop20DataQuality(bars) {
   metrics.duplicateBars = duplicates;
   if (malformed > 0) reasons.push('MALFORMED_BARS');
   if (duplicates > 0) reasons.push('DUPLICATE_BARS');
+
   const latest = bars[bars.length - 1];
   const barAgeSec = latest?.t ? (Date.now() - latest.t) / 1000 : Infinity;
   metrics.barAgeSec = Number.isFinite(barAgeSec) ? Number(barAgeSec.toFixed(1)) : null;
@@ -2089,6 +2109,7 @@ function evaluateTop20Technical(leader, bars) {
     sma10: currentSma10,
     momentumQuality,
   });
+
   // Contradiction guard: core bullish score cannot override clearly bearish immediate conditions.
   const contradictionReasons = [];
   if (criteria.sma10Above100 && !safety.metrics?.priceAboveSma10) contradictionReasons.push('PRICE_BELOW_10SMA');
@@ -2156,6 +2177,8 @@ function serializeTop20Result(result) {
     triggerPassed: Boolean(result.trigger?.passed),
     triggerUptrendConfirmed: Boolean(result.trigger?.uptrendConfirmed),
     triggerVolumeJumpPassed: Boolean(result.trigger?.volumeJumpPassed),
+    triggerMinCandleVolumePassed: Boolean(result.trigger?.minCandleVolumePassed),
+    triggerMinRequiredCandleVolume: Number(result.trigger?.minRequiredCandleVolume || TOP20_TRIGGER_MIN_CANDLE_VOLUME),
     triggerVolumeMultiplier: Number(result.trigger?.multiplier || 0),
     triggerCurrentCandleVolume: Number(result.trigger?.currentCandleVolume || 0),
     triggerPreviousCandleVolume: Number(result.trigger?.previousCandleVolume || 0),
@@ -2242,7 +2265,6 @@ function shouldSendTop20Alert(result) {
     belowThresholdSince: 0,
     lastBonus: false,
   };
-
   const score = result.score;
   const safetyPass = result.safety?.passed !== false;
   const qualifiesForAlert = score >= TOP20_MIN_SCORE && safetyPass;
@@ -2452,7 +2474,6 @@ async function scanTop20Technicals() {
         insufficientBars++;
         continue;
       }
-
       analyzed++;
       if (result.score === 4) qualifying4++;
       if (result.score === 5) qualifying5++;
@@ -2557,7 +2578,6 @@ async function scan() {
     console.log(`Outside scan window (${SCAN_START_HOUR_PT}–${SCAN_END_HOUR_PT} PT). Skipping.`);
     return;
   }
-
   if (isScanning) {
     console.log("Previous scan still running, skipping.");
     return;
@@ -2599,7 +2619,6 @@ async function scan() {
       })
       .filter(x => x.symbol && x.price > 0 && x.price >= PRICE_MIN && x.price <= PRICE_MAX)
       .filter(x => /^[A-Z]{1,5}$/.test(x.symbol));
-
     candidatesFound = raw.length;
     raw.sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct));
     if (MAX_CANDIDATES > 0) raw = raw.slice(0, MAX_CANDIDATES);
@@ -2683,7 +2702,6 @@ async function scan() {
           if (baseScore < MIN_MOMENTUM_SCORE) return;
 
           runnerCandidates++;
-
           let type = "RUNNER";
           if (breakout) type = "PM_BREAKOUT";
           if (effectiveFloat < LOW_FLOAT_THRESHOLD && c.pct >= 15 && rvol >= 8) {
@@ -2767,9 +2785,9 @@ async function scan() {
         }
       }
     });
-
     scoredAlerts.sort((a, b) => b.score - a.score);
     const topAlerts = scoredAlerts.slice(0, TOP_ALERTS_PER_SCAN);
+
     for (const payload of topAlerts) {
       const inserted = await insertAlert(payload);
       await pushToBase44(inserted);
@@ -2863,7 +2881,7 @@ app.listen(PORT, "0.0.0.0", () => {
     `Telegram: ${Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID)} | ` +
     `Base44: ${Boolean(BASE44_INGEST_URL && BASE44_API_KEY)} | ` +
     `Quantum: ${QUANTUM_ENABLED} | ` +
-    `Top20Scalp: ${TOP20_ENABLED}`
+    `Top50Scalp: ${TOP20_ENABLED}`
   );
 });
 
@@ -2878,4 +2896,4 @@ setInterval(scanTop20Technicals, TOP20_SCAN_INTERVAL_MS);
 
 // Reliability / learning maintenance: self-test + 1/3/5/10-minute outcome tracking.
 top20MaintenanceLoop();
-setInterval(top20MaintenanceLoop, 15_000);
+setInterval(top20MaintenanceLoop, 15_000);    
