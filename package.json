@@ -1,6 +1,6 @@
 {
-  "name": "quantum-simple-top50-30sec",
-  "version": "1.0.0",
+  "name": "quantum-simple-gainers-30sec",
+  "version": "2.0.0",
   "private": true,
   "main": "worker.js",
   "scripts": {
